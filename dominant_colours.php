@@ -46,7 +46,7 @@ add_action( 'updated_post_meta', 'difc_on_thumbnail_change', 5, 4 ); // Higher p
 add_action( 'added_post_meta',   'difc_on_thumbnail_change', 5, 4 ); // Higher priority
 add_action( 'set_post_thumbnail', 'difc_on_set_thumbnail', 5, 3 ); // Higher priority
 add_action( 'delete_post_thumbnail', 'difc_on_delete_thumbnail', 5, 1 ); // Track thumbnail removal
-add_action( 'save_post', 'difc_on_save_post', 10, 2 );
+add_action( 'save_post', 'difc_on_save_post', 20, 2 ); // Priority 20 to run after ACF processes
 
 // Also hook into attachment updates in case image is replaced
 add_action( 'edit_attachment', 'difc_on_attachment_edit', 10, 1 );
@@ -55,6 +55,34 @@ function difc_log( $message ) {
     if ( DIFC_DEBUG && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
         error_log( '[DIFC] ' . $message );
     }
+}
+
+/**
+ * Clear all caches related to a post to ensure fresh ACF field data
+ * 
+ * @param int $post_id Post ID
+ */
+function difc_clear_post_cache( $post_id ) {
+    // Clear WordPress post cache
+    clean_post_cache( $post_id );
+    
+    // Clear object cache for this post
+    wp_cache_delete( $post_id, 'posts' );
+    wp_cache_delete( $post_id, 'post_meta' );
+    
+    // Clear ACF cache if function exists (ACF 5.7+)
+    if ( function_exists( 'acf_get_store' ) ) {
+        try {
+            $store = acf_get_store( 'values' );
+            if ( $store ) {
+                $store->remove( $post_id );
+            }
+        } catch ( Exception $e ) {
+            // ACF store might not be available, continue silently
+        }
+    }
+    
+    difc_log( "Cleared cache for post {$post_id}" );
 }
 
 function difc_on_thumbnail_change( $meta_id, $post_id, $meta_key, $meta_value ) {
@@ -134,6 +162,16 @@ function difc_on_save_post( $post_id, $post ) {
             return;
         }
         
+        // Check if manual colors were recently set (prevents processing when user manually sets colors)
+        $manual_color_flag = get_post_meta( $post_id, '_manual_color_set', true );
+        if ( $manual_color_flag ) {
+            // If flag was set within last 5 minutes, skip processing to prevent memory issues
+            if ( ( time() - $manual_color_flag ) < 300 ) {
+                difc_log( "Post {$post_id} has recent manual color flag, skipping auto-discovery to prevent memory issues" );
+                return;
+            }
+        }
+        
         // If thumbnail didn't change, check if manual colors are already set
         if ( function_exists( 'get_field' ) ) {
             $existing_primary = get_field( DIFC_PRIMARY_FIELD, $post_id );
@@ -188,6 +226,16 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
             return false;
         }
         
+        // Check if manual colors were recently set (prevents processing when user manually sets colors)
+        $manual_color_flag = get_post_meta( $post_id, '_manual_color_set', true );
+        if ( $manual_color_flag && ! $force_update ) {
+            // If flag was set within last 5 minutes, skip processing to prevent memory issues
+            if ( ( time() - $manual_color_flag ) < 300 ) {
+                difc_log( "Post {$post_id} has recent manual color flag, skipping auto-discovery to prevent memory issues" );
+                return false;
+            }
+        }
+        
         // If not forcing update, check if manual colors are already set
         if ( ! $force_update && function_exists( 'get_field' ) ) {
             $existing_primary = get_field( DIFC_PRIMARY_FIELD, $post_id );
@@ -214,18 +262,50 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
             return false;
         }
         
+        // Increase memory limit temporarily for large image processing
+        $current_memory_limit = ini_get( 'memory_limit' );
+        $memory_limit_bytes = wp_convert_hr_to_bytes( $current_memory_limit );
+        if ( $memory_limit_bytes < 256 * 1024 * 1024 ) { // Less than 256MB
+            @ini_set( 'memory_limit', '256M' );
+            difc_log( "Temporarily increased memory limit from {$current_memory_limit} to 256M for image processing" );
+        }
+        
         difc_log( "Processing image: {$path}" );
+        
+        // Optional: Convert to sRGB if ImageMagick is available (graceful fallback if not)
+        $processed_path = difc_convert_to_srgb( $path );
+        $is_temp_file = ( $processed_path !== $path );
+        
+        if ( $is_temp_file ) {
+            difc_log( "Using ImageMagick-converted image for color extraction" );
+        } else {
+            difc_log( "Using original image for color extraction (GD only)" );
+        }
         
         // Wrap color extraction in error handling
         $colors = null;
         try {
-            $colors = difc_get_dominant_colors( $path );
+            $colors = difc_get_dominant_colors( $processed_path );
         } catch ( Exception $e ) {
             difc_log( "Error extracting colors from attachment {$attachment_id}: " . $e->getMessage() );
+            // Clean up temp file if created
+            if ( $is_temp_file && file_exists( $processed_path ) ) {
+                @unlink( $processed_path );
+            }
             return false;
         } catch ( Error $e ) {
             difc_log( "Fatal error extracting colors from attachment {$attachment_id}: " . $e->getMessage() );
+            // Clean up temp file if created
+            if ( $is_temp_file && file_exists( $processed_path ) ) {
+                @unlink( $processed_path );
+            }
             return false;
+        }
+        
+        // Clean up temporary file if ImageMagick conversion was used
+        if ( $is_temp_file && file_exists( $processed_path ) ) {
+            @unlink( $processed_path );
+            difc_log( "Cleaned up temporary converted image file" );
         }
         
         // Validate colors array
@@ -304,6 +384,39 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
         
         difc_log( "Saved colors to post {$post_id} - Primary: " . ( $primary_saved ? 'success' : 'failed' ) . ", Secondary: " . ( $secondary_saved ? 'success' : 'failed' ) );
         
+        // Clear all caches to ensure fresh data is available
+        difc_clear_post_cache( $post_id );
+        
+        // Verify fields were saved correctly (bypass cache by using format_value = false)
+        if ( function_exists( 'get_field' ) ) {
+            $verify_primary = get_field( DIFC_PRIMARY_FIELD, $post_id, false ); // false = no formatting, bypass cache
+            $verify_secondary = get_field( DIFC_SECONDARY_FIELD, $post_id, false );
+            
+            difc_log( "Verification - Expected primary: {$primary_to_save}, Got: " . ( $verify_primary ?: 'empty' ) );
+            difc_log( "Verification - Expected secondary: {$secondary_to_save}, Got: " . ( $verify_secondary ?: 'empty' ) );
+            
+            // If verification fails, retry save
+            if ( ( ! empty( $primary_to_save ) && $verify_primary !== $primary_to_save ) || 
+                 ( ! empty( $secondary_to_save ) && $verify_secondary !== $secondary_to_save ) ) {
+                difc_log( "Field verification failed - retrying save for post {$post_id}" );
+                
+                // Retry save
+                if ( ! empty( $primary_to_save ) && $verify_primary !== $primary_to_save ) {
+                    update_field( DIFC_PRIMARY_FIELD, $primary_to_save, $post_id );
+                    difc_log( "Retried saving primary color: {$primary_to_save}" );
+                }
+                if ( ! empty( $secondary_to_save ) && $verify_secondary !== $secondary_to_save ) {
+                    update_field( DIFC_SECONDARY_FIELD, $secondary_to_save, $post_id );
+                    difc_log( "Retried saving secondary color: {$secondary_to_save}" );
+                }
+                
+                // Clear cache again after retry
+                difc_clear_post_cache( $post_id );
+            } else {
+                difc_log( "Field verification successful for post {$post_id}" );
+            }
+        }
+        
         return $primary_saved !== false && $secondary_saved !== false;
     } catch ( Exception $e ) {
         // Catch any unexpected errors to prevent breaking the save process
@@ -322,6 +435,47 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
     }
 }
 
+/**
+ * Optional: Convert image to sRGB color space using ImageMagick CLI
+ * Returns original path if ImageMagick is not available (graceful fallback)
+ * 
+ * @param string $path Original image path
+ * @return string Path to converted image or original if conversion not possible
+ */
+function difc_convert_to_srgb( $path ) {
+    // Check if ImageMagick CLI is available (silent check, no errors if missing)
+    $magick_check = @shell_exec( 'which magick 2>/dev/null' );
+    if ( empty( $magick_check ) || trim( $magick_check ) === '' ) {
+        // ImageMagick not available, return original
+        difc_log( "ImageMagick CLI not available, using original image" );
+        return $path;
+    }
+    
+    // Check for color profile
+    $profile_check = @shell_exec( "magick identify -format '%[profiles:icc]' " . escapeshellarg( $path ) . " 2>/dev/null" );
+    if ( empty( $profile_check ) || trim( $profile_check ) === '' ) {
+        difc_log( "No color profile detected in image" );
+        return $path;
+    }
+    
+    difc_log( "Color profile detected: {$profile_check}, converting to sRGB" );
+    
+    // Create temporary file for converted image
+    $temp_path = sys_get_temp_dir() . '/difc_' . md5( $path ) . '_' . time() . '.jpg';
+    
+    // Convert to sRGB using ImageMagick
+    // Use -colorspace sRGB to convert without needing sRGB.icc file
+    $command = "magick convert " . escapeshellarg( $path ) . " -colorspace sRGB " . escapeshellarg( $temp_path ) . " 2>/dev/null";
+    $output = @shell_exec( $command );
+    
+    if ( file_exists( $temp_path ) && filesize( $temp_path ) > 0 ) {
+        difc_log( "ImageMagick: Successfully converted to sRGB: {$temp_path}" );
+        return $temp_path;
+    } else {
+        difc_log( "ImageMagick conversion failed, using original image" );
+        return $path; // Fallback to original
+    }
+}
 
 function difc_get_dominant_colors( $path ) {
     // ── 1. Load the image into a GD resource ──────────────────────────────
@@ -355,6 +509,209 @@ function difc_get_dominant_colors( $path ) {
         return [];
     }
 
+    // ── 1.5.1 Corner-First Uniform Background Detection (GD Only) ───────────
+    // Strategy: Sample the 4 corners first - if they're uniform, that's the background color
+    // Corners are least likely to have text/content, most likely to be pure background
+    
+    $corner_size = min( 50, (int) ( $width / 10 ), (int) ( $height / 10 ) ); // 10% or 50px, whichever is smaller
+    $corner_samples = [];
+    
+    // Sample all 4 corners densely
+    $corners = [
+        [0, 0, $corner_size, $corner_size], // Top-left
+        [$width - $corner_size, 0, $width, $corner_size], // Top-right
+        [0, $height - $corner_size, $corner_size, $height], // Bottom-left
+        [$width - $corner_size, $height - $corner_size, $width, $height], // Bottom-right
+    ];
+    
+    foreach ( $corners as $corner ) {
+        for ( $y = $corner[1]; $y < $corner[3]; $y++ ) {
+            for ( $x = $corner[0]; $x < $corner[2]; $x++ ) {
+                $rgb = imagecolorat( $img, $x, $y );
+                if ( $rgb !== false ) {
+                    $r = ( $rgb >> 16 ) & 0xFF;
+                    $g = ( $rgb >> 8  ) & 0xFF;
+                    $b =   $rgb        & 0xFF;
+                    // Skip pure white/black (likely text/foreground)
+                    if ( ! ( $r > 250 && $g > 250 && $b > 250 ) && ! ( $r < 5 && $g < 5 && $b < 5 ) ) {
+                        $corner_samples[] = [ $r, $g, $b ];
+                    }
+                }
+            }
+        }
+    }
+    
+    difc_log( "Corner-first detection: sampled " . count( $corner_samples ) . " corner pixels" );
+    
+    if ( count( $corner_samples ) >= 100 ) {
+        // Check if corners are uniform (use exact mode with 2-unit tolerance)
+        $color_groups = [];
+        foreach ( $corner_samples as $sample ) {
+            $matched = false;
+            foreach ( $color_groups as $key => &$group ) {
+                $group_color = $group['color'];
+                $diff = abs( $sample[0] - $group_color[0] ) + 
+                        abs( $sample[1] - $group_color[1] ) + 
+                        abs( $sample[2] - $group_color[2] );
+                if ( $diff <= 6 ) { // 2 units per channel = 6 total
+                    $group['count']++;
+                    $group['samples'][] = $sample;
+                    $matched = true;
+                    break;
+                }
+            }
+            unset( $group );
+            if ( ! $matched ) {
+                $color_groups[] = [
+                    'color' => $sample,
+                    'count' => 1,
+                    'samples' => [ $sample ]
+                ];
+            }
+        }
+        
+        // Sort by frequency
+        usort( $color_groups, function( $a, $b ) {
+            return $b['count'] <=> $a['count'];
+        } );
+        
+        $most_common = reset( $color_groups );
+        $most_common_pct = ( $most_common['count'] / count( $corner_samples ) ) * 100;
+        
+        difc_log( "Corner-first: most common color group represents {$most_common_pct}% of corner pixels" );
+        
+        // If 60%+ of corner pixels match, use that color
+        if ( $most_common_pct >= 60 ) {
+            // Use exact mode from the most common group
+            $exact_samples = $most_common['samples'];
+            $color_counts = [];
+            foreach ( $exact_samples as $sample ) {
+                $key = sprintf( '%03d-%03d-%03d', $sample[0], $sample[1], $sample[2] );
+                if ( ! isset( $color_counts[ $key ] ) ) {
+                    $color_counts[ $key ] = [ 'count' => 0, 'color' => $sample ];
+                }
+                $color_counts[ $key ]['count']++;
+            }
+            arsort( $color_counts );
+            $exact_color = reset( $color_counts );
+            
+            $primary_r = $exact_color['color'][0];
+            $primary_g = $exact_color['color'][1];
+            $primary_b = $exact_color['color'][2];
+            
+            $primary_color = sprintf( '#%02x%02x%02x', $primary_r, $primary_g, $primary_b );
+            difc_log( "Corner-first detection: {$primary_color} (from {$most_common_pct}% of corner pixels)" );
+            
+            $primary_hsl = difc_rgb_to_hsl( $primary_r, $primary_g, $primary_b );
+            $secondary_color = difc_get_contrast_fallback( $primary_hsl );
+            
+            imagedestroy( $img );
+            return [ $primary_color, $secondary_color ];
+        }
+    }
+
+    // ── 1.5.2 Check for uniform background (posters, solid colors) ───────────
+    // This helps with images that have a uniform background color
+    // Strategy: Sample ONLY from edges/corners first, check for uniformity
+    // If uniform, sample more from edges only (avoid center where text/content is)
+    
+    $edge_only_samples = [];
+    $edge_margin = max( 10, min( $width, $height ) * 0.1 ); // 10% margin or 10px, whichever is larger
+    
+    // Sample corners and edges more densely
+    $corner_size = min( 50, $width / 4, $height / 4 );
+    for ( $y = 0; $y < $height; $y++ ) {
+        for ( $x = 0; $x < $width; $x++ ) {
+            // Only sample from edges (corners and perimeter)
+            $is_corner = ( $x < $corner_size && $y < $corner_size ) ||
+                         ( $x >= $width - $corner_size && $y < $corner_size ) ||
+                         ( $x < $corner_size && $y >= $height - $corner_size ) ||
+                         ( $x >= $width - $corner_size && $y >= $height - $corner_size );
+            $is_edge = ( $x < $edge_margin || $x >= $width - $edge_margin || 
+                        $y < $edge_margin || $y >= $height - $edge_margin );
+            
+            if ( $is_corner || ( $is_edge && ( $x % 5 == 0 || $y % 5 == 0 ) ) ) {
+                $rgb = imagecolorat( $img, $x, $y );
+                if ( $rgb !== false ) {
+                    $r = ( $rgb >> 16 ) & 0xFF;
+                    $g = ( $rgb >> 8  ) & 0xFF;
+                    $b =   $rgb        & 0xFF;
+                    // Skip pure white and pure black (likely text/foreground)
+                    if ( ! ( $r > 250 && $g > 250 && $b > 250 ) && ! ( $r < 5 && $g < 5 && $b < 5 ) ) {
+                        $edge_only_samples[] = [ $r, $g, $b ];
+                    }
+                }
+            }
+        }
+    }
+    
+    difc_log( "Sampled " . count( $edge_only_samples ) . " edge pixels for uniform detection" );
+    
+    // Check if we have enough edge samples
+    if ( count( $edge_only_samples ) >= 20 ) {
+        // Use mode (most frequent color) for uniform backgrounds - more accurate than mean/median
+        // Group similar colors together with a small tolerance (3 RGB units) to handle compression artifacts
+        $color_counts = [];
+        foreach ( $edge_only_samples as $sample ) {
+            // Round to nearest 3 to handle slight variations from compression, but keep more precision
+            $r_rounded = (int) ( round( $sample[0] / 3 ) * 3 );
+            $g_rounded = (int) ( round( $sample[1] / 3 ) * 3 );
+            $b_rounded = (int) ( round( $sample[2] / 3 ) * 3 );
+            $key = sprintf( '%03d-%03d-%03d', $r_rounded, $g_rounded, $b_rounded );
+            
+            if ( ! isset( $color_counts[ $key ] ) ) {
+                $color_counts[ $key ] = [
+                    'count' => 0,
+                    'r' => $r_rounded,
+                    'g' => $g_rounded,
+                    'b' => $b_rounded,
+                    'samples' => []
+                ];
+            }
+            $color_counts[ $key ]['count']++;
+            $color_counts[ $key ]['samples'][] = $sample;
+        }
+        
+        // Sort by frequency
+        uasort( $color_counts, function( $a, $b ) {
+            return $b['count'] <=> $a['count'];
+        } );
+        
+        $most_common = reset( $color_counts );
+        $most_common_pct = ( $most_common['count'] / count( $edge_only_samples ) ) * 100;
+        
+        difc_log( "Most common edge color: RGB({$most_common['r']}, {$most_common['g']}, {$most_common['b']}) - {$most_common_pct}% of samples" );
+        
+        // If the most common color represents 30%+ of edge samples, treat as uniform background
+        // Lower threshold to catch more uniform backgrounds
+        if ( $most_common_pct >= 30 ) {
+            // Calculate exact color from the most common color group (use mean of that group)
+            $exact_samples = $most_common['samples'];
+            $sum_r = 0;
+            $sum_g = 0;
+            $sum_b = 0;
+            foreach ( $exact_samples as $sample ) {
+                $sum_r += $sample[0];
+                $sum_g += $sample[1];
+                $sum_b += $sample[2];
+            }
+            $primary_r = (int) ( $sum_r / count( $exact_samples ) );
+            $primary_g = (int) ( $sum_g / count( $exact_samples ) );
+            $primary_b = (int) ( $sum_b / count( $exact_samples ) );
+            
+            $primary_color = sprintf( '#%02x%02x%02x', $primary_r, $primary_g, $primary_b );
+            difc_log( "Detected uniform background color: {$primary_color} (from {$most_common_pct}% of edge samples)" );
+            
+            // For uniform backgrounds, secondary color is less important
+            // Use a lighter/darker version or white/black for contrast
+            $primary_hsl = difc_rgb_to_hsl( $primary_r, $primary_g, $primary_b );
+            $secondary_color = difc_get_contrast_fallback( $primary_hsl );
+            
+            imagedestroy( $img );
+            return [ $primary_color, $secondary_color ];
+        }
+    }
+    
     // Calculate center region bounds (inner 60% of image)
     $center_x_min = $width * 0.2;
     $center_x_max = $width * 0.8;
