@@ -5,6 +5,15 @@
  * Version: 1.1
  */
 
+// Log available image libraries (one-time check on plugin load)
+if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+    $has_imagick_ext = extension_loaded('imagick');
+    $has_gd = extension_loaded('gd');
+    $magick_check = @shell_exec( 'which magick 2>/dev/null' );
+    $has_imagick_cli = ! empty( $magick_check ) && trim( $magick_check ) !== '';
+    error_log( '[DIFC] Image libraries - PHP Imagick: ' . ( $has_imagick_ext ? 'yes' : 'no' ) . ', GD: ' . ( $has_gd ? 'yes' : 'no' ) . ', ImageMagick CLI: ' . ( $has_imagick_cli ? 'yes' : 'no' ) );
+}
+
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 // Change these to match your exact ACF field keys
 define( 'DIFC_PRIMARY_FIELD',   'custom_colour' );
