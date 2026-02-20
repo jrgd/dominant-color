@@ -37,6 +37,8 @@ define( 'DIFC_SATURATION_BOOST', 6.0 );      // Increased to strongly prefer vib
 define( 'DIFC_LEGIBILITY_WEIGHT', 2.5 );     // How much to weight legibility (lightness contrast) for text/background use
 define( 'DIFC_MIN_CONTRAST_RATIO', 4.5 );    // Minimum WCAG contrast ratio (4.5:1 = AA standard) - below this, use white/black fallback
 define( 'DIFC_CHROMA_CONTRAST_WEIGHT', 4.0 );  // How much to boost excellent chroma contrast (saturation + hue difference)
+define( 'DIFC_UNIFORM_THRESHOLD', 20 );        // RGB difference threshold for uniform background detection (higher = more lenient)
+define( 'DIFC_UNIFORM_MIN_SAMPLES', 0.7 );     // Minimum percentage of samples that must be uniform (0.7 = 70%)
 define( 'DIFC_DEBUG', false );
 // ─────────────────────────────────────────────────────────────────────────────
 
