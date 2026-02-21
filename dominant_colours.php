@@ -62,6 +62,16 @@ add_action( 'save_post', 'difc_on_save_post', 20, 2 ); // Priority 20 to run aft
 // Also hook into attachment updates in case image is replaced
 add_action( 'edit_attachment', 'difc_on_attachment_edit', 10, 1 );
 
+// Add meta box for manual color re-analysis
+add_action( 'add_meta_boxes', 'difc_add_meta_box' );
+add_action( 'admin_enqueue_scripts', 'difc_enqueue_admin_scripts' );
+add_action( 'wp_ajax_difc_reanalyze_colors', 'difc_ajax_reanalyze_colors' );
+
+// Add button for attachment color extraction
+add_action( 'attachment_fields_to_edit', 'difc_add_attachment_color_button', 10, 2 );
+add_action( 'admin_enqueue_scripts', 'difc_enqueue_attachment_scripts' );
+add_action( 'wp_ajax_difc_extract_attachment_colors', 'difc_ajax_extract_attachment_colors' );
+
 function difc_log( $message ) {
     if ( DIFC_DEBUG && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
         error_log( '[DIFC] ' . $message );
@@ -91,6 +101,25 @@ function difc_clear_post_cache( $post_id ) {
         } catch ( Exception $e ) {
             // ACF store might not be available, continue silently
         }
+    }
+    
+    // Clear specific ACF field caches
+    if ( function_exists( 'acf_flush_value_cache' ) ) {
+        acf_flush_value_cache( $post_id, DIFC_PRIMARY_FIELD );
+        acf_flush_value_cache( $post_id, DIFC_SECONDARY_FIELD );
+        // Clear palette fields for attachments
+        for ( $i = 1; $i <= 10; $i++ ) {
+            acf_flush_value_cache( $post_id, "image_col_{$i}_hex" );
+            acf_flush_value_cache( $post_id, "image_col_{$i}_name" );
+        }
+    }
+    
+    // Clear WordPress object cache more thoroughly
+    wp_cache_flush_group( 'post_meta' );
+    
+    // Clear opcache if available (for PHP opcache)
+    if ( function_exists( 'opcache_reset' ) && ini_get( 'opcache.enable' ) ) {
+        @opcache_reset();
     }
     
     difc_log( "Cleared cache for post {$post_id}" );
@@ -276,21 +305,22 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
         // Increase memory limit temporarily for large image processing
         $current_memory_limit = ini_get( 'memory_limit' );
         $memory_limit_bytes = wp_convert_hr_to_bytes( $current_memory_limit );
-        if ( $memory_limit_bytes < 256 * 1024 * 1024 ) { // Less than 256MB
-            @ini_set( 'memory_limit', '256M' );
-            difc_log( "Temporarily increased memory limit from {$current_memory_limit} to 256M for image processing" );
+        if ( $memory_limit_bytes < 512 * 1024 * 1024 ) { // Less than 512MB
+            @ini_set( 'memory_limit', '512M' );
+            difc_log( "Temporarily increased memory limit from {$current_memory_limit} to 512M for image processing" );
         }
         
         difc_log( "Processing image: {$path}" );
         
-        // Optional: Convert to sRGB if ImageMagick is available (graceful fallback if not)
-        $processed_path = difc_convert_to_srgb( $path );
+        // Optional: Convert to sRGB and resize if ImageMagick is available (graceful fallback if not)
+        // This preserves color profiles better than GD resizing
+        $processed_path = difc_convert_to_srgb( $path, 1000 );
         $is_temp_file = ( $processed_path !== $path );
         
         if ( $is_temp_file ) {
-            difc_log( "Using ImageMagick-converted image for color extraction" );
+            difc_log( "Using ImageMagick-processed image (color profile converted and/or resized)" );
         } else {
-            difc_log( "Using original image for color extraction (GD only)" );
+            difc_log( "Using original image, will resize with GD if needed" );
         }
         
         // Wrap color extraction in error handling
@@ -340,10 +370,10 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
             return false;
         }
         
-        // Ensure we have at least one color, pad with empty string for secondary if needed
-        $colors = array_pad( $validated_colors, 2, '' );
+        // Ensure we have at least 10 colors (pad if needed)
+        $colors = array_pad( $validated_colors, 10, '' );
         
-        difc_log( "Detected colors: " . implode( ', ', $colors ) );
+        difc_log( "Detected colors: " . implode( ', ', array_slice( $colors, 0, 10 ) ) );
         
         // Only update fields that are empty (if not forcing update)
         $primary_to_save = $colors[0] ?? '';
@@ -374,7 +404,7 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
             return false;
         }
         
-        // Save as HEX strings to your ACF fields
+        // Save primary and secondary colors to post
         $primary_saved = false;
         $secondary_saved = false;
         
@@ -395,8 +425,46 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
         
         difc_log( "Saved colors to post {$post_id} - Primary: " . ( $primary_saved ? 'success' : 'failed' ) . ", Secondary: " . ( $secondary_saved ? 'success' : 'failed' ) );
         
+        // Save 10-color palette to media attachment (fields are in groups: color_1, color_2, etc.)
+        try {
+            for ( $i = 0; $i < 10; $i++ ) {
+                $color_hex = $colors[ $i ] ?? '';
+                $color_index = $i + 1;
+                $group_name = "color_{$color_index}";
+                $field_hex = "image_col_{$color_index}_hex";
+                $field_name = "image_col_{$color_index}_name";
+                
+                if ( ! empty( $color_hex ) && preg_match( '/^#[0-9a-fA-F]{6}$/', $color_hex ) ) {
+                    // Generate color name if not already set
+                    $existing_name = get_field( $field_name, $attachment_id );
+                    $color_name = empty( $existing_name ) ? difc_get_color_name( $color_hex ) : $existing_name;
+                    
+                    // Update group field with both hex and name
+                    $group_data = [
+                        $field_hex => $color_hex,
+                        $field_name => $color_name,
+                    ];
+                    
+                    $group_result = update_field( $group_name, $group_data, $attachment_id );
+                    
+                    // Fallback: try updating sub-fields directly
+                    if ( ! $group_result ) {
+                        update_field( $field_hex, $color_hex, $attachment_id );
+                        if ( empty( $existing_name ) ) {
+                            update_field( $field_name, $color_name, $attachment_id );
+                        }
+                    }
+                }
+            }
+            difc_log( "Saved 10-color palette to attachment {$attachment_id}" );
+        } catch ( Exception $e ) {
+            difc_log( "Error saving palette to attachment {$attachment_id}: " . $e->getMessage() );
+            // Don't fail the whole operation if palette save fails
+        }
+        
         // Clear all caches to ensure fresh data is available
         difc_clear_post_cache( $post_id );
+        difc_clear_post_cache( $attachment_id ); // Also clear cache for attachment
         
         // Verify fields were saved correctly (bypass cache by using format_value = false)
         if ( function_exists( 'get_field' ) ) {
@@ -447,45 +515,141 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
 }
 
 /**
- * Optional: Convert image to sRGB color space using ImageMagick CLI
+ * Optional: Convert image to sRGB color space and resize using ImageMagick CLI
+ * This preserves color profiles better than GD resizing
  * Returns original path if ImageMagick is not available (graceful fallback)
  * 
  * @param string $path Original image path
+ * @param int $max_dimension Maximum width or height for resizing (default 1000px)
  * @return string Path to converted image or original if conversion not possible
  */
-function difc_convert_to_srgb( $path ) {
+function difc_convert_to_srgb( $path, $max_dimension = 1000 ) {
     // Check if ImageMagick CLI is available (silent check, no errors if missing)
     $magick_check = @shell_exec( 'which magick 2>/dev/null' );
     if ( empty( $magick_check ) || trim( $magick_check ) === '' ) {
-        // ImageMagick not available, return original
-        difc_log( "ImageMagick CLI not available, using original image" );
+        // ImageMagick not available, return original (will be resized by GD later)
+        difc_log( "ImageMagick CLI not available, will use GD for resizing" );
         return $path;
     }
+    
+    // Get image dimensions to check if resizing is needed
+    $dimensions = @shell_exec( "magick identify -format '%wx%h' " . escapeshellarg( $path ) . " 2>/dev/null" );
+    if ( empty( $dimensions ) ) {
+        difc_log( "Could not get image dimensions, using original" );
+        return $path;
+    }
+    
+    list( $width, $height ) = explode( 'x', trim( $dimensions ) );
+    $width = (int) $width;
+    $height = (int) $height;
+    $needs_resize = ( $width > $max_dimension || $height > $max_dimension );
     
     // Check for color profile
     $profile_check = @shell_exec( "magick identify -format '%[profiles:icc]' " . escapeshellarg( $path ) . " 2>/dev/null" );
-    if ( empty( $profile_check ) || trim( $profile_check ) === '' ) {
-        difc_log( "No color profile detected in image" );
+    $has_profile = ! empty( $profile_check ) && trim( $profile_check ) !== '';
+    
+    // If no color profile and no resize needed, return original
+    if ( ! $has_profile && ! $needs_resize ) {
+        difc_log( "No color profile and image is already small enough, using original" );
         return $path;
     }
-    
-    difc_log( "Color profile detected: {$profile_check}, converting to sRGB" );
     
     // Create temporary file for converted image
     $temp_path = sys_get_temp_dir() . '/difc_' . md5( $path ) . '_' . time() . '.jpg';
     
-    // Convert to sRGB using ImageMagick
-    // Use -colorspace sRGB to convert without needing sRGB.icc file
-    $command = "magick convert " . escapeshellarg( $path ) . " -colorspace sRGB " . escapeshellarg( $temp_path ) . " 2>/dev/null";
+    // Build ImageMagick command
+    $command_parts = [ "magick convert", escapeshellarg( $path ) ];
+    
+    // Convert to sRGB if color profile exists
+    if ( $has_profile ) {
+        $command_parts[] = "-colorspace sRGB";
+        difc_log( "Color profile detected: {$profile_check}, converting to sRGB" );
+    }
+    
+    // Resize if needed (preserves color space)
+    if ( $needs_resize ) {
+        // Calculate new dimensions maintaining aspect ratio
+        if ( $width > $height ) {
+            $new_size = $max_dimension . 'x';
+        } else {
+            $new_size = 'x' . $max_dimension;
+        }
+        $command_parts[] = "-resize {$new_size}";
+        difc_log( "Resizing from {$width}x{$height} to max {$max_dimension}px using ImageMagick (preserves color profile)" );
+    }
+    
+    $command_parts[] = escapeshellarg( $temp_path );
+    $command = implode( ' ', $command_parts ) . " 2>/dev/null";
+    
     $output = @shell_exec( $command );
     
     if ( file_exists( $temp_path ) && filesize( $temp_path ) > 0 ) {
-        difc_log( "ImageMagick: Successfully converted to sRGB: {$temp_path}" );
+        $action = [];
+        if ( $has_profile ) $action[] = "converted to sRGB";
+        if ( $needs_resize ) $action[] = "resized";
+        difc_log( "ImageMagick: Successfully " . implode( " and ", $action ) . ": {$temp_path}" );
         return $temp_path;
     } else {
         difc_log( "ImageMagick conversion failed, using original image" );
         return $path; // Fallback to original
     }
+}
+
+/**
+ * Resize image to a maximum dimension to reduce memory usage
+ * Color extraction doesn't need full resolution, so we can safely resize large images
+ * 
+ * @param resource $img GD image resource
+ * @param int $max_dimension Maximum width or height (default 1000px)
+ * @return resource|false Resized image resource or false on failure
+ */
+function difc_resize_image_for_processing( $img, $max_dimension = 1000 ) {
+    $width  = imagesx( $img );
+    $height = imagesy( $img );
+    
+    // If image is already smaller than max dimension, return as-is
+    if ( $width <= $max_dimension && $height <= $max_dimension ) {
+        return $img;
+    }
+    
+    // Calculate new dimensions maintaining aspect ratio
+    if ( $width > $height ) {
+        $new_width  = $max_dimension;
+        $new_height = (int) ( $height * ( $max_dimension / $width ) );
+    } else {
+        $new_height = $max_dimension;
+        $new_width  = (int) ( $width * ( $max_dimension / $height ) );
+    }
+    
+    difc_log( "Resizing image from {$width}x{$height} to {$new_width}x{$new_height} to reduce memory usage" );
+    
+    // Create resized image
+    $resized = imagecreatetruecolor( $new_width, $new_height );
+    if ( ! $resized ) {
+        difc_log( "Failed to create resized image resource" );
+        return $img; // Return original on failure
+    }
+    
+    // Preserve transparency for PNG/GIF
+    imagealphablending( $resized, false );
+    imagesavealpha( $resized, true );
+    $transparent = imagecolorallocatealpha( $resized, 0, 0, 0, 127 );
+    imagefill( $resized, 0, 0, $transparent );
+    imagealphablending( $resized, true );
+    
+    // Resize with high quality
+    $success = imagecopyresampled( $resized, $img, 0, 0, 0, 0, $new_width, $new_height, $width, $height );
+    
+    if ( ! $success ) {
+        difc_log( "Failed to resize image" );
+        imagedestroy( $resized );
+        return $img; // Return original on failure
+    }
+    
+    // Destroy original to free memory
+    imagedestroy( $img );
+    
+    return $resized;
 }
 
 function difc_get_dominant_colors( $path ) {
@@ -508,6 +672,14 @@ function difc_get_dominant_colors( $path ) {
 
     if ( ! $img ) {
         difc_log( "Could not create image resource from: {$path}" );
+        return [];
+    }
+
+    // Resize large images to reduce memory usage if not already resized by ImageMagick
+    // (ImageMagick resizing preserves color profiles better, but GD fallback is fine)
+    $img = difc_resize_image_for_processing( $img, 1000 );
+    if ( ! $img ) {
+        difc_log( "Failed to resize image for processing" );
         return [];
     }
 
@@ -854,8 +1026,9 @@ function difc_get_dominant_colors( $path ) {
     );
 
     // Secondary color: find the most salient color that contrasts well with primary
+    $primary_hsl = $primary['hsl_center'];
+    
     if ( count( $clusters ) > 1 ) {
-        $primary_hsl = $primary['hsl_center'];
         $best_secondary = null;
         $best_score = -1;
 
@@ -972,6 +1145,30 @@ function difc_get_dominant_colors( $path ) {
             $results[] = $fallback_color;
             difc_log( "No secondary color found, using fallback: {$fallback_color}" );
         }
+    } else {
+        // Only one cluster - still need a secondary color, use fallback
+        $fallback_color = difc_get_contrast_fallback( $primary_hsl );
+        $results[] = $fallback_color;
+        difc_log( "Only one cluster found, using fallback for secondary: {$fallback_color}" );
+    }
+
+    // Extract up to 10 colors for palette (extend results array)
+    // Colors 1 and 2 are already primary and secondary
+    $palette_colors = array_slice( $clusters, 0, 10 ); // Get top 10 clusters
+    for ( $i = 2; $i < count( $palette_colors ); $i++ ) {
+        $cluster = $palette_colors[ $i ];
+        $results[] = sprintf(
+            '#%02x%02x%02x',
+            $cluster['rgb_center'][0],
+            $cluster['rgb_center'][1],
+            $cluster['rgb_center'][2]
+        );
+    }
+    
+    // Pad to 10 colors if we have fewer
+    while ( count( $results ) < 10 ) {
+        // Use variations of primary color or fallback
+        $results[] = $fallback_color;
     }
 
     return $results;
@@ -1298,4 +1495,805 @@ if ( is_admin() ) {
             wp_die( "Processed {$count} events. <a href='" . admin_url() . "'>Go back</a>" );
         }
     } );
+}
+
+/**
+ * Add meta box for color re-analysis
+ */
+function difc_add_meta_box() {
+    add_meta_box(
+        'difc_reanalyze_colors',
+        __( 'Featured Image Colors', 'difc' ),
+        'difc_reanalyze_meta_box_callback',
+        DIFC_POST_TYPE,
+        'side',
+        'default'
+    );
+}
+
+/**
+ * Meta box callback - displays current colors and re-analyze button
+ */
+function difc_reanalyze_meta_box_callback( $post ) {
+    $thumbnail_id = get_post_thumbnail_id( $post->ID );
+    $primary_color = function_exists( 'get_field' ) ? get_field( DIFC_PRIMARY_FIELD, $post->ID ) : '';
+    $secondary_color = function_exists( 'get_field' ) ? get_field( DIFC_SECONDARY_FIELD, $post->ID ) : '';
+    
+    wp_nonce_field( 'difc_reanalyze_' . $post->ID, 'difc_reanalyze_nonce' );
+    ?>
+    <div id="difc-reanalyze-container">
+        <?php if ( $thumbnail_id ) : ?>
+            <p>
+                <strong><?php _e( 'Current Colors:', 'difc' ); ?></strong>
+            </p>
+            <div style="margin: 10px 0;">
+                <?php if ( $primary_color ) : ?>
+                    <p>
+                        <label><?php _e( 'Primary:', 'difc' ); ?></label><br>
+                        <span style="display: inline-block; width: 30px; height: 30px; background-color: <?php echo esc_attr( $primary_color ); ?>; border: 1px solid #ccc; vertical-align: middle; margin-right: 5px;"></span>
+                        <code><?php echo esc_html( $primary_color ); ?></code>
+                    </p>
+                <?php else : ?>
+                    <p style="color: #d63638;"><?php _e( 'Primary color not set', 'difc' ); ?></p>
+                <?php endif; ?>
+                
+                <?php if ( $secondary_color ) : ?>
+                    <p>
+                        <label><?php _e( 'Secondary:', 'difc' ); ?></label><br>
+                        <span style="display: inline-block; width: 30px; height: 30px; background-color: <?php echo esc_attr( $secondary_color ); ?>; border: 1px solid #ccc; vertical-align: middle; margin-right: 5px;"></span>
+                        <code><?php echo esc_html( $secondary_color ); ?></code>
+                    </p>
+                <?php else : ?>
+                    <p style="color: #d63638;"><?php _e( 'Secondary color not set', 'difc' ); ?></p>
+                <?php endif; ?>
+            </div>
+            
+            <p>
+                <button type="button" id="difc-reanalyze-btn" class="button button-secondary" data-post-id="<?php echo esc_attr( $post->ID ); ?>">
+                    <span class="dashicons dashicons-update" style="vertical-align: middle;"></span>
+                    <?php _e( 'Re-analyze Colors', 'difc' ); ?>
+                </button>
+            </p>
+            <div id="difc-reanalyze-message" style="margin-top: 10px; display: none;"></div>
+        <?php else : ?>
+            <p style="color: #d63638;">
+                <?php _e( 'Please set a featured image first.', 'difc' ); ?>
+            </p>
+        <?php endif; ?>
+    </div>
+    <?php
+}
+
+/**
+ * Enqueue admin scripts for the re-analyze button
+ */
+function difc_enqueue_admin_scripts( $hook ) {
+    // Only load on post edit screens for event post type
+    if ( ! in_array( $hook, [ 'post.php', 'post-new.php' ] ) ) {
+        return;
+    }
+    
+    global $post;
+    if ( ! $post || get_post_type( $post->ID ) !== DIFC_POST_TYPE ) {
+        return;
+    }
+    
+    // Add CSS for spinner animation
+    wp_add_inline_style( 'wp-admin', '
+        @keyframes difc-spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        .dashicons.difc-spinning {
+            animation: difc-spin 1s linear infinite;
+        }
+    ' );
+    
+    // Add script in footer to ensure jQuery is loaded
+    add_action( 'admin_footer', 'difc_add_reanalyze_script' );
+}
+
+/**
+ * Add inline script for re-analyze button (called in admin_footer)
+ */
+function difc_add_reanalyze_script() {
+    global $post;
+    if ( ! $post || get_post_type( $post->ID ) !== DIFC_POST_TYPE ) {
+        return;
+    }
+    
+    $nonce = wp_create_nonce( 'difc_reanalyze_ajax' );
+    ?>
+    <script type="text/javascript">
+    jQuery(document).ready(function($) {
+        $('#difc-reanalyze-btn').on('click', function(e) {
+            e.preventDefault();
+            var $btn = $(this);
+            var $msg = $('#difc-reanalyze-message');
+            var postId = $btn.data('post-id');
+            
+            // Disable button and show loading
+            $btn.prop('disabled', true);
+            $btn.html('<span class="dashicons dashicons-update difc-spinning" style="vertical-align: middle;"></span> <?php echo esc_js( __( 'Analyzing...', 'difc' ) ); ?>');
+            $msg.hide().removeClass('notice-error notice-success').html('');
+            
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: {
+                    action: 'difc_reanalyze_colors',
+                    post_id: postId,
+                    nonce: '<?php echo esc_js( $nonce ); ?>'
+                },
+                success: function(response) {
+                    if (response.success) {
+                        $msg.addClass('notice notice-success is-dismissible').html('<p>' + response.data.message + '</p>').show();
+                        // Reload page after 1.5 seconds to show updated colors
+                        setTimeout(function() {
+                            location.reload();
+                        }, 1500);
+                    } else {
+                        $msg.addClass('notice notice-error is-dismissible').html('<p>' + (response.data && response.data.message ? response.data.message : '<?php echo esc_js( __( 'An error occurred.', 'difc' ) ); ?>') + '</p>').show();
+                        $btn.prop('disabled', false);
+                        $btn.html('<span class="dashicons dashicons-update" style="vertical-align: middle;"></span> <?php echo esc_js( __( 'Re-analyze Colors', 'difc' ) ); ?>');
+                    }
+                },
+                error: function() {
+                    $msg.addClass('notice notice-error is-dismissible').html('<p><?php echo esc_js( __( 'Network error. Please try again.', 'difc' ) ); ?></p>').show();
+                    $btn.prop('disabled', false);
+                    $btn.html('<span class="dashicons dashicons-update" style="vertical-align: middle;"></span> <?php echo esc_js( __( 'Re-analyze Colors', 'difc' ) ); ?>');
+                }
+            });
+        });
+    });
+    </script>
+    <?php
+}
+
+/**
+ * Generate a descriptive color name from hex value
+ * 
+ * @param string $hex Hex color value (e.g., #FF5733)
+ * @return string Color name (e.g., "Sunset Orange", "Sky Blue")
+ */
+function difc_get_color_name( $hex ) {
+    if ( ! preg_match( '/^#[0-9a-fA-F]{6}$/', $hex ) ) {
+        return '';
+    }
+    
+    // Remove # and convert to RGB
+    $hex = str_replace( '#', '', $hex );
+    $r = hexdec( substr( $hex, 0, 2 ) );
+    $g = hexdec( substr( $hex, 2, 2 ) );
+    $b = hexdec( substr( $hex, 4, 2 ) );
+    
+    // Convert to HSL for better color naming
+    $hsl = difc_rgb_to_hsl( $r, $g, $b );
+    $h = $hsl[0]; // 0-1
+    $s = $hsl[1]; // 0-1
+    $l = $hsl[2]; // 0-1
+    
+    // Determine base hue name
+    $hue_names = [
+        [ 0.0, 0.04, 'Red' ],
+        [ 0.04, 0.12, 'Orange' ],
+        [ 0.12, 0.20, 'Yellow' ],
+        [ 0.20, 0.35, 'Green' ],
+        [ 0.35, 0.55, 'Cyan' ],
+        [ 0.55, 0.70, 'Blue' ],
+        [ 0.70, 0.85, 'Purple' ],
+        [ 0.85, 0.95, 'Pink' ],
+        [ 0.95, 1.0, 'Red' ],
+    ];
+    
+    $base_hue = 'Gray';
+    foreach ( $hue_names as $range ) {
+        if ( $h >= $range[0] && $h < $range[1] ) {
+            $base_hue = $range[2];
+            break;
+        }
+    }
+    
+    // If saturation is very low, it's a gray/neutral
+    if ( $s < 0.1 ) {
+        if ( $l < 0.2 ) {
+            return 'Charcoal';
+        } elseif ( $l < 0.4 ) {
+            return 'Dark Gray';
+        } elseif ( $l < 0.6 ) {
+            return 'Gray';
+        } elseif ( $l < 0.8 ) {
+            return 'Light Gray';
+        } else {
+            return 'Off White';
+        }
+    }
+    
+    // Determine lightness modifier
+    $lightness_modifier = '';
+    if ( $l < 0.2 ) {
+        $lightness_modifier = 'Dark ';
+    } elseif ( $l < 0.35 ) {
+        $lightness_modifier = 'Deep ';
+    } elseif ( $l > 0.8 ) {
+        $lightness_modifier = 'Light ';
+    } elseif ( $l > 0.65 ) {
+        $lightness_modifier = 'Bright ';
+    }
+    
+    // Determine saturation modifier
+    $saturation_modifier = '';
+    if ( $s > 0.7 ) {
+        $saturation_modifier = 'Vivid ';
+    } elseif ( $s < 0.3 ) {
+        $saturation_modifier = 'Muted ';
+    }
+    
+    // Special color names for common combinations
+    $special_names = [
+        // Blues
+        [ 0.55, 0.70, 0.4, 0.7, 0.3, 0.6, 'Sky Blue' ],
+        [ 0.55, 0.70, 0.5, 0.9, 0.2, 0.4, 'Ocean Blue' ],
+        [ 0.55, 0.70, 0.6, 0.9, 0.1, 0.3, 'Navy Blue' ],
+        // Greens
+        [ 0.20, 0.35, 0.4, 0.7, 0.3, 0.5, 'Forest Green' ],
+        [ 0.20, 0.35, 0.5, 0.8, 0.4, 0.7, 'Emerald Green' ],
+        [ 0.20, 0.35, 0.6, 0.9, 0.5, 0.8, 'Lime Green' ],
+        // Reds/Oranges
+        [ 0.0, 0.12, 0.4, 0.8, 0.4, 0.7, 'Sunset Orange' ],
+        [ 0.0, 0.04, 0.4, 0.8, 0.3, 0.6, 'Crimson Red' ],
+        [ 0.04, 0.12, 0.5, 0.9, 0.5, 0.8, 'Golden Yellow' ],
+        // Purples/Pinks
+        [ 0.70, 0.85, 0.4, 0.7, 0.3, 0.6, 'Royal Purple' ],
+        [ 0.85, 0.95, 0.5, 0.8, 0.5, 0.8, 'Rose Pink' ],
+    ];
+    
+    foreach ( $special_names as $special ) {
+        if ( $h >= $special[0] && $h < $special[1] && 
+             $s >= $special[2] && $s < $special[3] && 
+             $l >= $special[4] && $l < $special[5] ) {
+            return $special[6];
+        }
+    }
+    
+    // Build descriptive name
+    $name = $saturation_modifier . $lightness_modifier . $base_hue;
+    
+    return trim( $name );
+}
+
+/**
+ * AJAX handler for re-analyzing colors
+ */
+function difc_ajax_reanalyze_colors() {
+    // Verify nonce
+    if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'difc_reanalyze_ajax' ) ) {
+        wp_send_json_error( [ 'message' => __( 'Security check failed.', 'difc' ) ] );
+        return;
+    }
+    
+    // Check permissions
+    if ( ! current_user_can( 'edit_posts' ) ) {
+        wp_send_json_error( [ 'message' => __( 'You do not have permission to perform this action.', 'difc' ) ] );
+        return;
+    }
+    
+    $post_id = isset( $_POST['post_id'] ) ? intval( $_POST['post_id'] ) : 0;
+    
+    if ( ! $post_id ) {
+        wp_send_json_error( [ 'message' => __( 'Invalid post ID.', 'difc' ) ] );
+        return;
+    }
+    
+    // Verify post type
+    if ( get_post_type( $post_id ) !== DIFC_POST_TYPE ) {
+        wp_send_json_error( [ 'message' => __( 'Invalid post type.', 'difc' ) ] );
+        return;
+    }
+    
+    // Get thumbnail ID
+    $thumbnail_id = get_post_thumbnail_id( $post_id );
+    if ( ! $thumbnail_id ) {
+        wp_send_json_error( [ 'message' => __( 'No featured image set for this post.', 'difc' ) ] );
+        return;
+    }
+    
+    // Force re-analysis
+    $result = difc_extract_and_save( $post_id, $thumbnail_id, true );
+    
+    if ( $result ) {
+        // Clear caches to ensure fresh data
+        difc_clear_post_cache( $post_id );
+        
+        // Get the new colors
+        $primary_color = function_exists( 'get_field' ) ? get_field( DIFC_PRIMARY_FIELD, $post_id ) : '';
+        $secondary_color = function_exists( 'get_field' ) ? get_field( DIFC_SECONDARY_FIELD, $post_id ) : '';
+        
+        $message = __( 'Colors successfully re-analyzed!', 'difc' );
+        if ( $primary_color && $secondary_color ) {
+            $message .= ' ' . sprintf( __( 'Primary: %s, Secondary: %s', 'difc' ), $primary_color, $secondary_color );
+        }
+        
+        wp_send_json_success( [ 'message' => $message ] );
+    } else {
+        wp_send_json_error( [ 'message' => __( 'Failed to extract colors. Please check the error logs.', 'difc' ) ] );
+    }
+}
+
+/**
+ * Add re-analyze button to attachment edit screen
+ */
+function difc_add_attachment_color_button( $fields, $post ) {
+    // Only show for image attachments
+    if ( ! wp_attachment_is_image( $post->ID ) ) {
+        return $fields;
+    }
+    
+    $attachment_id = $post->ID;
+    $fields['difc_extract_colors'] = [
+        'label' => __( 'Color Palette', 'difc' ),
+        'input' => 'html',
+        'html' => sprintf(
+            '<div id="difc-attachment-color-container" style="margin: 10px 0;">
+                <button type="button" id="difc-extract-attachment-colors-btn" class="button button-secondary" data-attachment-id="%d" onclick="console.log(\'DIFC: Direct click on button, ID: %d\'); return false;">
+                    <span class="dashicons dashicons-update" style="vertical-align: middle;"></span>
+                    %s
+                </button>
+                <div id="difc-attachment-color-message" style="margin-top: 10px; display: none;"></div>
+            </div>',
+            $attachment_id,
+            $attachment_id,
+            esc_html__( 'Extract Color Palette', 'difc' )
+        ),
+    ];
+    
+    return $fields;
+}
+
+/**
+ * Enqueue scripts for attachment color extraction
+ */
+function difc_enqueue_attachment_scripts( $hook ) {
+    // Load on all admin pages (media modals can be opened from anywhere)
+    if ( ! is_admin() ) {
+        return;
+    }
+    
+    // Add CSS for spinner animation
+    wp_add_inline_style( 'wp-admin', '
+        @keyframes difc-spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        .dashicons.difc-spinning {
+            animation: difc-spin 1s linear infinite;
+        }
+    ' );
+    
+    // Add script in footer (always, so it works in media modals)
+    add_action( 'admin_footer', 'difc_add_attachment_extract_script' );
+}
+
+/**
+ * Add inline script for attachment color extraction button
+ */
+function difc_add_attachment_extract_script() {
+    $nonce = wp_create_nonce( 'difc_extract_attachment_colors' );
+    ?>
+    <script type="text/javascript">
+    console.log('DIFC: Script loaded');
+    (function($) {
+        'use strict';
+        
+        var nonce = '<?php echo esc_js( $nonce ); ?>';
+        console.log('DIFC: Nonce created:', nonce ? 'yes' : 'no');
+        
+        // Handler for button click
+        function handleExtractColors(attachmentId, $btn, $msg) {
+            // Disable button and show loading
+            $btn.prop('disabled', true);
+            $btn.html('<span class="dashicons dashicons-update difc-spinning" style="vertical-align: middle;"></span> <?php echo esc_js( __( 'Extracting colors...', 'difc' ) ); ?>');
+            if ($msg) {
+                $msg.hide().removeClass('notice-error notice-success').html('');
+            }
+            
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: {
+                    action: 'difc_extract_attachment_colors',
+                    attachment_id: attachmentId,
+                    nonce: nonce
+                },
+                success: function(response) {
+                    console.log('DIFC AJAX Response:', response);
+                    if (response.success) {
+                        var successMsg = response.data.message || '<?php echo esc_js( __( 'Colors extracted successfully!', 'difc' ) ); ?>';
+                        if ($msg) {
+                            $msg.addClass('notice notice-success is-dismissible').html('<p>' + successMsg + '</p>').show();
+                        } else {
+                            alert(successMsg);
+                        }
+                        // Reload page after 1.5 seconds to show updated colors
+                        setTimeout(function() {
+                            location.reload();
+                        }, 1500);
+                    } else {
+                        var errorMsg = response.data && response.data.message ? response.data.message : '<?php echo esc_js( __( 'An error occurred.', 'difc' ) ); ?>';
+                        console.error('DIFC Error:', errorMsg);
+                        if ($msg) {
+                            $msg.addClass('notice notice-error is-dismissible').html('<p>' + errorMsg + '</p>').show();
+                        } else {
+                            alert(errorMsg);
+                        }
+                        $btn.prop('disabled', false);
+                        $btn.html('<span class="dashicons dashicons-update" style="vertical-align: middle;"></span> <?php echo esc_js( __( 'Extract Color Palette', 'difc' ) ); ?>');
+                    }
+                },
+                error: function(xhr, status, error) {
+                    console.error('DIFC AJAX Error:', status, error, xhr);
+                    var errorMsg = '<?php echo esc_js( __( 'Network error. Please try again.', 'difc' ) ); ?>';
+                    if (xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message) {
+                        errorMsg = xhr.responseJSON.data.message;
+                    }
+                    if ($msg) {
+                        $msg.addClass('notice notice-error is-dismissible').html('<p>' + errorMsg + '</p>').show();
+                    } else {
+                        alert(errorMsg);
+                    }
+                    $btn.prop('disabled', false);
+                    $btn.html('<span class="dashicons dashicons-update" style="vertical-align: middle;"></span> <?php echo esc_js( __( 'Extract Color Palette', 'difc' ) ); ?>');
+                }
+            });
+        }
+        
+        // Handle button on attachment edit page - use event delegation
+        $(document).on('click', '#difc-extract-attachment-colors-btn, #difc-extract-attachment-colors-btn-modal', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            console.log('DIFC: Button clicked!', this.id);
+            var $btn = $(this);
+            var attachmentId = $btn.data('attachment-id') || $btn.attr('data-attachment-id');
+            console.log('DIFC: Attachment ID:', attachmentId);
+            
+            if (!attachmentId) {
+                console.error('DIFC: No attachment ID found!');
+                alert('Error: No attachment ID found');
+                return;
+            }
+            
+            // Find message container (different for edit page vs modal)
+            var $msg = $btn.closest('.difc-color-extraction-section, #difc-reanalyze-container').find('[id*="message"]').first();
+            if ($msg.length === 0) {
+                $msg = $('#difc-attachment-color-message, #difc-attachment-color-message-modal').first();
+            }
+            
+            console.log('DIFC: Message container found:', $msg.length > 0);
+            handleExtractColors(attachmentId, $btn, $msg.length > 0 ? $msg : null);
+        });
+        
+        console.log('DIFC: Event handlers attached');
+        
+        // Add button to media library modal attachment details
+        if (typeof wp !== 'undefined' && wp.media) {
+            wp.media.view.Attachment.Details = wp.media.view.Attachment.Details.extend({
+                render: function() {
+                    wp.media.view.Attachment.Details.prototype.render.apply(this, arguments);
+                    
+                    var attachment = this.model;
+                    if (attachment.get('type') === 'image') {
+                        var $details = this.$el.find('.attachment-details');
+                        var attachmentId = attachment.get('id');
+                        
+                        // Check if button already exists
+                        if ($details.find('#difc-extract-attachment-colors-btn-modal').length === 0) {
+                            var $colorSection = $('<div class="difc-color-extraction-section" style="margin: 15px 0; padding: 15px; border-top: 1px solid #ddd;"></div>');
+                            $colorSection.append('<h3 style="margin-top: 0;"><?php echo esc_js( __( 'Color Palette', 'difc' ) ); ?></h3>');
+                            $colorSection.append('<button type="button" id="difc-extract-attachment-colors-btn-modal" class="button button-secondary" data-attachment-id="' + attachmentId + '"><span class="dashicons dashicons-update" style="vertical-align: middle;"></span> <?php echo esc_js( __( 'Extract Color Palette', 'difc' ) ); ?></button>');
+                            $colorSection.append('<div id="difc-attachment-color-message-modal" style="margin-top: 10px; display: none;"></div>');
+                            $details.append($colorSection);
+                            
+                            // Button click is handled by document-level delegation above
+                            console.log('DIFC: Button added to modal for attachment', attachmentId);
+                        }
+                    }
+                    
+                    return this;
+                }
+            });
+        }
+    })(jQuery);
+    </script>
+    <?php
+}
+
+/**
+ * AJAX handler for extracting colors from attachment
+ */
+function difc_ajax_extract_attachment_colors() {
+    // Enable error logging for debugging
+    error_log( '[DIFC] AJAX handler called' );
+    
+    // Verify nonce
+    if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'difc_extract_attachment_colors' ) ) {
+        error_log( '[DIFC] Nonce verification failed' );
+        wp_send_json_error( [ 'message' => __( 'Security check failed.', 'difc' ) ] );
+        return;
+    }
+    
+    // Check permissions
+    if ( ! current_user_can( 'edit_posts' ) ) {
+        error_log( '[DIFC] Permission check failed' );
+        wp_send_json_error( [ 'message' => __( 'You do not have permission to perform this action.', 'difc' ) ] );
+        return;
+    }
+    
+    $attachment_id = isset( $_POST['attachment_id'] ) ? intval( $_POST['attachment_id'] ) : 0;
+    error_log( "[DIFC] Processing attachment ID: {$attachment_id}" );
+    
+    if ( ! $attachment_id ) {
+        wp_send_json_error( [ 'message' => __( 'Invalid attachment ID.', 'difc' ) ] );
+        return;
+    }
+    
+    // Verify it's an image
+    if ( ! wp_attachment_is_image( $attachment_id ) ) {
+        wp_send_json_error( [ 'message' => __( 'This is not an image attachment.', 'difc' ) ] );
+        return;
+    }
+    
+    // Extract colors directly for attachment (not tied to a post)
+    $path = get_attached_file( $attachment_id );
+    if ( ! $path || ! file_exists( $path ) ) {
+        wp_send_json_error( [ 'message' => __( 'Image file not found.', 'difc' ) ] );
+        return;
+    }
+    
+    // Increase memory limit temporarily
+    $current_memory_limit = ini_get( 'memory_limit' );
+    $memory_limit_bytes = wp_convert_hr_to_bytes( $current_memory_limit );
+    if ( $memory_limit_bytes < 512 * 1024 * 1024 ) {
+        @ini_set( 'memory_limit', '512M' );
+    }
+    
+    // Convert to sRGB and resize if needed
+    $processed_path = difc_convert_to_srgb( $path, 1000 );
+    
+    // Extract colors
+    try {
+        error_log( "[DIFC] Extracting colors from: {$processed_path}" );
+        $colors = difc_get_dominant_colors( $processed_path );
+        error_log( "[DIFC] Extracted " . count( $colors ) . " colors" );
+    } catch ( Exception $e ) {
+        error_log( "[DIFC] Exception extracting colors: " . $e->getMessage() );
+        wp_send_json_error( [ 'message' => sprintf( __( 'Error extracting colors: %s', 'difc' ), $e->getMessage() ) ] );
+        return;
+    } catch ( Error $e ) {
+        error_log( "[DIFC] Fatal error extracting colors: " . $e->getMessage() );
+        wp_send_json_error( [ 'message' => sprintf( __( 'Fatal error extracting colors: %s', 'difc' ), $e->getMessage() ) ] );
+        return;
+    }
+    
+    // Clean up temp file if created
+    if ( $processed_path !== $path && file_exists( $processed_path ) ) {
+        @unlink( $processed_path );
+    }
+    
+    if ( ! is_array( $colors ) || empty( $colors ) ) {
+        wp_send_json_error( [ 'message' => __( 'No colors detected in image.', 'difc' ) ] );
+        return;
+    }
+    
+    // Validate and pad colors
+    $validated_colors = [];
+    foreach ( $colors as $color ) {
+        if ( is_string( $color ) && preg_match( '/^#[0-9a-fA-F]{6}$/', $color ) ) {
+            $validated_colors[] = $color;
+        }
+    }
+    
+    if ( empty( $validated_colors ) ) {
+        wp_send_json_error( [ 'message' => __( 'No valid colors detected.', 'difc' ) ] );
+        return;
+    }
+    
+    // Pad to 10 colors
+    $colors = array_pad( $validated_colors, 10, '' );
+    
+    // Save colors to attachment fields (fields are in groups: color_1, color_2, etc.)
+    // ACF group fields need to be updated as an array with sub-field names as keys
+    $saved_count = 0;
+    $errors = [];
+    
+    // Debug: List all meta keys on this attachment to see what ACF created
+    $all_meta = get_post_meta( $attachment_id );
+    error_log( "[DIFC] All meta keys on attachment {$attachment_id}:" );
+    foreach ( $all_meta as $key => $value ) {
+        if ( strpos( $key, 'color' ) !== false || strpos( $key, 'image_col' ) !== false || strpos( $key, 'media_color' ) !== false ) {
+            error_log( "[DIFC]   - {$key}: " . ( is_array( $value ) ? print_r( $value, true ) : $value[0] ?? 'empty' ) );
+        }
+    }
+    
+    try {
+        for ( $i = 0; $i < 10; $i++ ) {
+            $color_hex = $colors[ $i ] ?? '';
+            $color_index = $i + 1;
+            $group_name = "color_{$color_index}";
+            $field_hex = "image_col_{$color_index}_hex";
+            $field_name = "image_col_{$color_index}_name";
+            
+            if ( ! empty( $color_hex ) && preg_match( '/^#[0-9a-fA-F]{6}$/', $color_hex ) ) {
+                // Generate color name
+                $color_name = difc_get_color_name( $color_hex );
+                
+                // Update the group field with an array containing both sub-fields
+                // ACF expects group fields to be updated as: group_name => [sub_field_name => value, ...]
+                $group_data = [
+                    $field_hex => $color_hex,
+                    $field_name => $color_name,
+                ];
+                
+                // Try multiple field name variations
+                $field_variations = [
+                    $group_name,  // color_1
+                    "media_color_palette_{$group_name}",  // media_color_palette_color_1
+                    "media_color_palette_{$field_hex}",  // media_color_palette_image_col_1_hex (direct sub-field)
+                ];
+                
+                $group_field = false;
+                $found_field_name = false;
+                
+                // Try to find the field using different names
+                foreach ( $field_variations as $field_name_to_try ) {
+                    $test_field = get_field_object( $field_name_to_try, $attachment_id, false );
+                    if ( $test_field ) {
+                        $group_field = $test_field;
+                        $found_field_name = $field_name_to_try;
+                        error_log( "[DIFC] Found field using name: {$field_name_to_try}, key: " . ( $group_field['key'] ?? 'none' ) );
+                        break;
+                    }
+                }
+                
+                // If group field not found, try getting all fields to see what's available
+                if ( ! $group_field ) {
+                    error_log( "[DIFC] Field {$group_name} not found, checking all fields on attachment {$attachment_id}" );
+                    
+                    // Get all field groups for this attachment
+                    $field_groups = acf_get_field_groups( [ 'post_type' => 'attachment' ] );
+                    error_log( "[DIFC] Found " . count( $field_groups ) . " field groups for attachments" );
+                    
+                    foreach ( $field_groups as $fg ) {
+                        error_log( "[DIFC] Field group: {$fg['title']} (key: {$fg['key']})" );
+                        $fields_in_group = acf_get_fields( $fg );
+                        if ( $fields_in_group ) {
+                            foreach ( $fields_in_group as $f ) {
+                                error_log( "[DIFC]   - Field: {$f['name']} (key: {$f['key']}, type: {$f['type']})" );
+                                if ( $f['name'] === $group_name || $f['name'] === 'media_color_palette' ) {
+                                    $group_field = $f;
+                                    $found_field_name = $f['name'];
+                                    error_log( "[DIFC]   -> Matched! Using this field" );
+                                    break 2;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Try updating sub-fields directly first (simpler approach)
+                // ACF allows updating nested group sub-fields directly using the full path
+                $hex_result = update_field( $field_hex, $color_hex, $attachment_id );
+                $name_result = update_field( $field_name, $color_name, $attachment_id );
+                
+                error_log( "[DIFC] Direct sub-field update - hex field '{$field_hex}': " . ( $hex_result !== false ? 'success' : 'failed' ) . ", name field '{$field_name}': " . ( $name_result !== false ? 'success' : 'failed' ) );
+                
+                // Also try with group prefix
+                if ( $hex_result === false ) {
+                    $hex_result = update_field( "{$group_name}_{$field_hex}", $color_hex, $attachment_id );
+                    error_log( "[DIFC] Trying with group prefix '{$group_name}_{$field_hex}': " . ( $hex_result !== false ? 'success' : 'failed' ) );
+                }
+                if ( $name_result === false ) {
+                    $name_result = update_field( "{$group_name}_{$field_name}", $color_name, $attachment_id );
+                    error_log( "[DIFC] Trying with group prefix '{$group_name}_{$field_name}': " . ( $name_result !== false ? 'success' : 'failed' ) );
+                }
+                
+                // Last resort: try updating post meta directly
+                if ( $hex_result === false || $name_result === false ) {
+                    error_log( "[DIFC] Trying direct post_meta update" );
+                    // ACF stores fields as meta with field name as key
+                    $meta_hex_result = update_post_meta( $attachment_id, $field_hex, $color_hex );
+                    $meta_name_result = update_post_meta( $attachment_id, $field_name, $color_name );
+                    error_log( "[DIFC] Direct meta update - hex: " . ( $meta_hex_result ? 'success' : 'failed' ) . ", name: " . ( $meta_name_result ? 'success' : 'failed' ) );
+                    
+                    if ( $meta_hex_result || $meta_name_result ) {
+                        $hex_result = $meta_hex_result ? true : $hex_result;
+                        $name_result = $meta_name_result ? true : $name_result;
+                    }
+                }
+                
+                if ( $hex_result !== false || $name_result !== false ) {
+                    $saved_count++;
+                    error_log( "[DIFC] Successfully saved color {$color_index} using direct sub-field update" );
+                    continue; // Success, move to next color
+                }
+                
+                // If direct update failed, try group update
+                if ( ! $group_field ) {
+                    error_log( "[DIFC] Field {$group_name} still not found after searching" );
+                    // Try one more time with just the group name, maybe ACF will find it
+                    $group_result = update_field( $group_name, $group_data, $attachment_id );
+                    if ( $group_result !== false ) {
+                        $saved_count++;
+                        error_log( "[DIFC] Successfully saved color {$color_index} using group name directly" );
+                        continue;
+                    }
+                    $errors[] = "Field {$group_name} not found";
+                    continue;
+                }
+                
+                error_log( "[DIFC] Using field name: {$found_field_name}, updating with data: " . print_r( $group_data, true ) );
+                
+                // Try updating with the found field name
+                $group_result = update_field( $found_field_name, $group_data, $attachment_id );
+                
+                if ( $group_result !== false ) {
+                    $saved_count++;
+                    error_log( "[DIFC] Successfully saved color {$color_index} using field name" );
+                } else {
+                    // Try with field key
+                    if ( isset( $group_field['key'] ) ) {
+                        error_log( "[DIFC] Trying with field key: {$group_field['key']}" );
+                        $key_result = update_field( $group_field['key'], $group_data, $attachment_id );
+                        if ( $key_result !== false ) {
+                            $saved_count++;
+                            error_log( "[DIFC] Successfully saved color {$color_index} using field key" );
+                        } else {
+                            $errors[] = "Failed to save color {$color_index} (all methods failed)";
+                            error_log( "[DIFC] All update methods failed for {$group_name}" );
+                        }
+                    } else {
+                        $errors[] = "Failed to save color {$color_index} (no field key available)";
+                        error_log( "[DIFC] Failed to save group {$group_name}, no field key" );
+                    }
+                }
+            }
+        }
+        
+        // Clear cache
+        difc_clear_post_cache( $attachment_id );
+        
+        // Also clear ACF cache specifically
+        if ( function_exists( 'acf_get_store' ) ) {
+            try {
+                $store = acf_get_store( 'values' );
+                if ( $store ) {
+                    $store->remove( $attachment_id );
+                }
+            } catch ( Exception $e ) {
+                // Ignore cache errors
+            }
+        }
+        
+        error_log( "[DIFC] Saved {$saved_count} colors to attachment {$attachment_id}" );
+        if ( ! empty( $errors ) ) {
+            error_log( "[DIFC] Errors: " . implode( ', ', $errors ) );
+        }
+        
+        if ( $saved_count > 0 ) {
+            $message = sprintf( __( 'Successfully extracted and saved %d colors with names!', 'difc' ), $saved_count );
+            if ( ! empty( $errors ) ) {
+                $message .= ' ' . __( 'Some colors failed to save.', 'difc' );
+            }
+            wp_send_json_success( [ 'message' => $message, 'saved_count' => $saved_count ] );
+        } else {
+            $error_msg = __( 'No colors were saved.', 'difc' );
+            if ( ! empty( $errors ) ) {
+                $error_msg .= ' ' . implode( ', ', $errors );
+            }
+            wp_send_json_error( [ 'message' => $error_msg, 'errors' => $errors ] );
+        }
+    } catch ( Exception $e ) {
+        wp_send_json_error( [ 'message' => sprintf( __( 'Error saving colors: %s', 'difc' ), $e->getMessage() ) ] );
+    } catch ( Error $e ) {
+        wp_send_json_error( [ 'message' => sprintf( __( 'Fatal error saving colors: %s', 'difc' ), $e->getMessage() ) ] );
+    }
 }
