@@ -205,45 +205,59 @@ function difc_on_save_post( $post_id, $post ) {
         }
         
         // Check if thumbnail changed by comparing with previous value
-        // If thumbnail changed, we should force update colors even if manual colors exist
         $previous_thumbnail = get_post_meta( $post_id, '_previous_thumbnail_id', true );
         $thumbnail_changed = ( $previous_thumbnail != $thumbnail_id );
         
         // Update the previous thumbnail ID for next comparison
         update_post_meta( $post_id, '_previous_thumbnail_id', $thumbnail_id );
         
-        // If thumbnail changed, force update (new image = new colors)
-        if ( $thumbnail_changed ) {
-            difc_log( "Post {$post_id} thumbnail changed from {$previous_thumbnail} to {$thumbnail_id}, forcing color update" );
-            difc_extract_and_save( $post_id, $thumbnail_id, true ); // true = force update
-            return;
-        }
-        
+        // Read existing colors once for logging / decision making
+        $existing_primary   = function_exists( 'get_field' ) ? get_field( DIFC_PRIMARY_FIELD, $post_id ) : '';
+        $existing_secondary = function_exists( 'get_field' ) ? get_field( DIFC_SECONDARY_FIELD, $post_id ) : '';
+        $has_any_existing   = ( ! empty( $existing_primary ) || ! empty( $existing_secondary ) );
+
         // Check if manual colors were recently set (prevents processing when user manually sets colors)
         $manual_color_flag = get_post_meta( $post_id, '_manual_color_set', true );
         if ( $manual_color_flag ) {
             // If flag was set within last 5 minutes, skip processing to prevent memory issues
             if ( ( time() - $manual_color_flag ) < 300 ) {
-                difc_log( "Post {$post_id} has recent manual color flag, skipping auto-discovery to prevent memory issues" );
+                difc_log(
+                    "Post {$post_id} has recent manual color flag, skipping auto-discovery on save to prevent memory issues"
+                );
                 return;
             }
         }
-        
-        // If thumbnail didn't change, check if manual colors are already set
-        if ( function_exists( 'get_field' ) ) {
-            $existing_primary = get_field( DIFC_PRIMARY_FIELD, $post_id );
-            $existing_secondary = get_field( DIFC_SECONDARY_FIELD, $post_id );
-            
-            // If both colors are set, skip auto-discovery (user has manually set colors)
-            if ( ! empty( $existing_primary ) && ! empty( $existing_secondary ) ) {
-                difc_log( "Post {$post_id} has manual colors set, skipping auto-discovery" );
-                return;
-            }
+
+        // If any color already exists, treat colors as locked and never auto-overwrite on save
+        if ( $has_any_existing ) {
+            difc_log(
+                "Post {$post_id} already has existing colors on save (primary: " .
+                ( $existing_primary ?: 'none' ) .
+                ", secondary: " .
+                ( $existing_secondary ?: 'none' ) .
+                "), skipping auto-discovery (thumbnail changed: " .
+                ( $thumbnail_changed ? 'yes' : 'no' ) .
+                ")"
+            );
+            return;
         }
-        
-        // Thumbnail didn't change and colors not fully set, proceed with update
-        difc_log( "Post {$post_id} saved with thumbnail {$thumbnail_id}" );
-        difc_extract_and_save( $post_id, $thumbnail_id, false ); // false = respect existing colors
+
+        // No existing colors: only then consider auto-processing.
+        if ( $thumbnail_changed ) {
+            difc_log(
+                "Post {$post_id} thumbnail changed from {$previous_thumbnail} to {$thumbnail_id} with no existing colors, auto-discovering"
+            );
+            // Allow extraction to run, but still treat it as non-explicit (force_update = false) so that
+            // difc_extract_and_save can honour debounce/flags consistently.
+            difc_extract_and_save( $post_id, $thumbnail_id, false );
+            return;
+        }
+
+        // Thumbnail didn't change and colors not set: proceed with update
+        difc_log(
+            "Post {$post_id} saved with thumbnail {$thumbnail_id} and no existing colors, auto-discovering"
+        );
+        difc_extract_and_save( $post_id, $thumbnail_id, false ); // false = respect locking / flags
     } catch ( Exception $e ) {
         difc_log( "Error in difc_on_save_post: " . $e->getMessage() );
     } catch ( Error $e ) {
@@ -456,26 +470,36 @@ function difc_extract_and_save( $post_id, $attachment_id, $force_update = true )
             return false;
         }
         
-        // Check if manual colors were recently set (prevents processing when user manually sets colors)
+        // Check if manual or existing colors should lock auto-processing.
+        // Once any color exists (primary OR secondary), we treat colors as locked and
+        // never auto-overwrite them from background hooks. Only an explicit re-analyze
+        // action in the admin should be able to override them.
+        $existing_primary   = function_exists( 'get_field' ) ? get_field( DIFC_PRIMARY_FIELD, $post_id ) : '';
+        $existing_secondary = function_exists( 'get_field' ) ? get_field( DIFC_SECONDARY_FIELD, $post_id ) : '';
+        $has_any_existing   = ( ! empty( $existing_primary ) || ! empty( $existing_secondary ) );
+
+        // Respect recent manual color flag on all non-explicit calls.
         $manual_color_flag = get_post_meta( $post_id, '_manual_color_set', true );
         if ( $manual_color_flag && ! $force_update ) {
             // If flag was set within last 5 minutes, skip processing to prevent memory issues
             if ( ( time() - $manual_color_flag ) < 300 ) {
-                difc_log( "Post {$post_id} has recent manual color flag, skipping auto-discovery to prevent memory issues" );
+                difc_log(
+                    "Post {$post_id} has recent manual color flag, skipping auto-discovery to prevent memory issues"
+                );
                 return false;
             }
         }
-        
-        // If not forcing update, check if manual colors are already set
-        if ( ! $force_update && function_exists( 'get_field' ) ) {
-            $existing_primary = get_field( DIFC_PRIMARY_FIELD, $post_id );
-            $existing_secondary = get_field( DIFC_SECONDARY_FIELD, $post_id );
-            
-            // If both colors are set, skip auto-discovery (user has manually set colors)
-            if ( ! empty( $existing_primary ) && ! empty( $existing_secondary ) ) {
-                difc_log( "Post {$post_id} has manual colors set, skipping auto-discovery" );
-                return false;
-            }
+
+        // If any color already exists and this is not an explicit override, skip.
+        if ( $has_any_existing && ! $force_update ) {
+            difc_log(
+                "Post {$post_id} has existing colors (primary: " .
+                ( $existing_primary ?: 'none' ) .
+                ", secondary: " .
+                ( $existing_secondary ?: 'none' ) .
+                "), skipping auto-discovery"
+            );
+            return false;
         }
         
         // Get the path to the image file on disk
