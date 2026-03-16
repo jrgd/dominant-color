@@ -31,7 +31,7 @@ define( 'DIFC_CLUSTER_THRESHOLD', 30 );
 // Salience configuration
 define( 'DIFC_MIN_SATURATION', 0.15 );      // Minimum saturation (0-1) to consider a color salient
 define( 'DIFC_CENTER_WEIGHT', 2.0 );        // Multiplier for center region pixels (2x more important)
-define( 'DIFC_SATURATION_WEIGHT', 1.5 );    // How much to boost highly saturated colors
+define( 'DIFC_SATURATION_WEIGHT', 2.5 );    // How much to boost highly saturated colors (increased to prioritize vibrant colors like pink)
 define( 'DIFC_LUMINANCE_PREFERENCE', 0.5 );  // Preferred luminance (0-1, 0.5 = middle gray)
 
 // Enable debug logging (set to true for troubleshooting)
@@ -46,9 +46,11 @@ define( 'DIFC_SATURATION_BOOST', 6.0 );      // Increased to strongly prefer vib
 define( 'DIFC_LEGIBILITY_WEIGHT', 2.5 );     // How much to weight legibility (lightness contrast) for text/background use
 define( 'DIFC_MIN_CONTRAST_RATIO', 4.5 );    // Minimum WCAG contrast ratio (4.5:1 = AA standard) - below this, use white/black fallback
 define( 'DIFC_CHROMA_CONTRAST_WEIGHT', 4.0 );  // How much to boost excellent chroma contrast (saturation + hue difference)
+define( 'DIFC_CHROMA_SORT_BOOST', 0.5 );        // How much to boost clusters with high chroma/saturation in sorting (0.5 = 50% boost, increased to prioritize vibrant colors)
+define( 'DIFC_MAX_CLUSTERS', 10 );              // Maximum number of color clusters (increased to preserve more distinct colors in palette)
 define( 'DIFC_UNIFORM_THRESHOLD', 20 );        // RGB difference threshold for uniform background detection (higher = more lenient)
 define( 'DIFC_UNIFORM_MIN_SAMPLES', 0.7 );     // Minimum percentage of samples that must be uniform (0.7 = 70%)
-define( 'DIFC_DEBUG', false );
+define( 'DIFC_DEBUG', true ); // Enable for debugging color extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -72,8 +74,15 @@ add_action( 'attachment_fields_to_edit', 'difc_add_attachment_color_button', 10,
 add_action( 'admin_enqueue_scripts', 'difc_enqueue_attachment_scripts' );
 add_action( 'wp_ajax_difc_extract_attachment_colors', 'difc_ajax_extract_attachment_colors' );
 
+// New: Automatically extract palettes for image attachments on upload
+add_action( 'add_attachment', 'difc_on_add_attachment' );
+
+// AJAX endpoint for JavaScript to check if colors were updated server-side
+add_action( 'wp_ajax_difc_check_color_update', 'difc_ajax_check_color_update' );
+
 function difc_log( $message ) {
-    if ( DIFC_DEBUG && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+    // Always log if DIFC_DEBUG is true, or if WP_DEBUG is enabled
+    if ( DIFC_DEBUG || ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
         error_log( '[DIFC] ' . $message );
     }
 }
@@ -132,7 +141,15 @@ function difc_on_thumbnail_change( $meta_id, $post_id, $meta_key, $meta_value ) 
         }
         // This hook only fires when thumbnail meta changes, so always force update
         difc_log( "Thumbnail meta changed for post {$post_id}, attachment: {$meta_value}" );
-        difc_extract_and_save( $post_id, (int) $meta_value, true ); // Force update when thumbnail changes
+        
+        // Extract and save colors
+        $result = difc_extract_and_save( $post_id, (int) $meta_value, true ); // Force update when thumbnail changes
+        
+        // Set a timestamp flag that JavaScript can poll to detect server-side updates
+        // This helps when the hook fires but JavaScript hasn't detected the change yet
+        update_post_meta( $post_id, '_difc_colors_updated_timestamp', time() );
+        update_post_meta( $post_id, '_difc_colors_updated_image_id', (int) $meta_value );
+        
     } catch ( Exception $e ) {
         difc_log( "Error in difc_on_thumbnail_change: " . $e->getMessage() );
     } catch ( Error $e ) {
@@ -248,6 +265,179 @@ function difc_on_attachment_edit( $attachment_id ) {
         difc_log( "Attachment {$attachment_id} edited, updating post {$post_id}" );
         difc_extract_and_save( $post_id, $attachment_id, true ); // Force update when attachment is edited
     }
+}
+
+/**
+ * New: Attachment-centric extraction wrapper
+ * Generates a 10-color palette for any image attachment, without requiring an event post.
+ *
+ * @param int  $attachment_id
+ * @param bool $force_update If true, ignore debounce/previous palette checks.
+ *
+ * @return bool
+ */
+function difc_extract_for_attachment( $attachment_id, $force_update = false ) {
+    try {
+        // Only process image attachments
+        if ( ! wp_attachment_is_image( $attachment_id ) ) {
+            difc_log( "Skipping attachment {$attachment_id} - not an image" );
+            return false;
+        }
+
+        // Optional debounce: skip if we've processed recently, unless forcing
+        if ( ! $force_update ) {
+            $last_processed = get_post_meta( $attachment_id, '_difc_attachment_processed', true );
+            if ( $last_processed && ( time() - (int) $last_processed ) < 60 ) { // 60 second guard
+                difc_log( "Attachment {$attachment_id} processed recently, skipping" );
+                return false;
+            }
+        }
+
+        // Get image path
+        $path = get_attached_file( $attachment_id );
+        if ( ! $path || ! file_exists( $path ) ) {
+            difc_log( "Image file not found for attachment {$attachment_id}: " . ( $path ?: 'no path' ) );
+            return false;
+        }
+
+        // Size / memory guards (reuse logic from difc_extract_and_save)
+        $file_size = @filesize( $path );
+        if ( $file_size && $file_size > 50 * 1024 * 1024 ) { // 50MB limit
+            difc_log( "Image file too large ({$file_size} bytes) for attachment {$attachment_id}, skipping" );
+            return false;
+        }
+
+        $current_memory_limit = ini_get( 'memory_limit' );
+        $memory_limit_bytes   = wp_convert_hr_to_bytes( $current_memory_limit );
+        if ( $memory_limit_bytes < 512 * 1024 * 1024 ) {
+            @ini_set( 'memory_limit', '512M' );
+            difc_log( "Temporarily increased memory limit from {$current_memory_limit} to 512M for attachment {$attachment_id}" );
+        }
+
+        // Convert to sRGB / resize
+        $processed_path = difc_convert_to_srgb( $path, 1000 );
+        $is_temp_file   = ( $processed_path !== $path );
+
+        // Extract colors using existing pipeline
+        try {
+            difc_log( "[ATTACHMENT] Extracting colors from: {$processed_path}" );
+            $colors = difc_get_dominant_colors( $processed_path );
+            difc_log( "[ATTACHMENT] Extracted " . ( is_array( $colors ) ? count( $colors ) : 0 ) . " colors" );
+        } catch ( Exception $e ) {
+            difc_log( "[ATTACHMENT] Exception extracting colors: " . $e->getMessage() );
+            if ( $is_temp_file && file_exists( $processed_path ) ) {
+                @unlink( $processed_path );
+            }
+            return false;
+        } catch ( Error $e ) {
+            difc_log( "[ATTACHMENT] Fatal error extracting colors: " . $e->getMessage() );
+            if ( $is_temp_file && file_exists( $processed_path ) ) {
+                @unlink( $processed_path );
+            }
+            return false;
+        }
+
+        // Clean up temp file
+        if ( $is_temp_file && file_exists( $processed_path ) ) {
+            @unlink( $processed_path );
+        }
+
+        if ( ! is_array( $colors ) || empty( $colors ) ) {
+            difc_log( "[ATTACHMENT] No colors detected for attachment {$attachment_id}" );
+            return false;
+        }
+
+        // Validate and pad colors
+        $validated_colors = [];
+        foreach ( $colors as $color ) {
+            if ( is_string( $color ) && preg_match( '/^#[0-9a-fA-F]{6}$/', $color ) ) {
+                $validated_colors[] = $color;
+            }
+        }
+
+        if ( empty( $validated_colors ) ) {
+            difc_log( "[ATTACHMENT] No valid hex colors detected for attachment {$attachment_id}" );
+            return false;
+        }
+
+        $colors = array_pad( $validated_colors, 10, '' );
+
+        // Ensure ACF is available for palette fields
+        if ( ! function_exists( 'update_field' ) ) {
+            difc_log( "[ATTACHMENT] ACF not available, cannot save palette for attachment {$attachment_id}" );
+            return false;
+        }
+
+        // Optionally warm ACF field groups for attachments
+        if ( function_exists( 'acf_get_field_groups' ) ) {
+            acf_get_field_groups( [ 'post_type' => 'attachment' ] );
+        }
+
+        // Save 10-color palette to attachment (same structure as difc_extract_and_save)
+        try {
+            for ( $i = 0; $i < 10; $i++ ) {
+                $color_hex   = $colors[ $i ] ?? '';
+                $color_index = $i + 1;
+                $group_name  = "color_{$color_index}";
+                $field_hex   = "image_col_{$color_index}_hex";
+                $field_name  = "image_col_{$color_index}_name";
+
+                if ( ! empty( $color_hex ) && preg_match( '/^#[0-9a-fA-F]{6}$/', $color_hex ) ) {
+                    $existing_name = function_exists( 'get_field' ) ? get_field( $field_name, $attachment_id ) : '';
+                    $color_name    = empty( $existing_name ) ? difc_get_color_name( $color_hex ) : $existing_name;
+
+                    $group_data = [
+                        $field_hex  => $color_hex,
+                        $field_name => $color_name,
+                    ];
+
+                    $group_result = update_field( $group_name, $group_data, $attachment_id );
+
+                    if ( ! $group_result ) {
+                        update_field( $field_hex, $color_hex, $attachment_id );
+                        if ( empty( $existing_name ) ) {
+                            update_field( $field_name, $color_name, $attachment_id );
+                        }
+                    }
+                }
+            }
+
+            difc_log( "[ATTACHMENT] Saved 10-color palette to attachment {$attachment_id}" );
+        } catch ( Exception $e ) {
+            difc_log( "[ATTACHMENT] Error saving palette to attachment {$attachment_id}: " . $e->getMessage() );
+        } catch ( Error $e ) {
+            difc_log( "[ATTACHMENT] Fatal error saving palette to attachment {$attachment_id}: " . $e->getMessage() );
+        }
+
+        // Mark as processed
+        update_post_meta( $attachment_id, '_difc_attachment_processed', time() );
+
+        // Clear caches for this attachment
+        difc_clear_post_cache( $attachment_id );
+
+        return true;
+    } catch ( Exception $e ) {
+        difc_log( "[ATTACHMENT] Unexpected error for attachment {$attachment_id}: " . $e->getMessage() );
+        return false;
+    } catch ( Error $e ) {
+        difc_log( "[ATTACHMENT] Unexpected fatal error for attachment {$attachment_id}: " . $e->getMessage() );
+        return false;
+    }
+}
+
+/**
+ * New: Hook run when a new attachment is added (e.g., Media Library → Add New)
+ *
+ * @param int $attachment_id
+ */
+function difc_on_add_attachment( $attachment_id ) {
+    // Only process images
+    if ( ! wp_attachment_is_image( $attachment_id ) ) {
+        return;
+    }
+
+    difc_log( "[ATTACHMENT] add_attachment hook for {$attachment_id}" );
+    difc_extract_for_attachment( $attachment_id, false );
 }
 
 function difc_extract_and_save( $post_id, $attachment_id, $force_update = true ) {
@@ -763,9 +953,9 @@ function difc_get_dominant_colors( $path ) {
         
         difc_log( "Corner-first: most common color group represents {$most_common_pct}% of corner pixels" );
         
-        // If 60%+ of corner pixels match, use that color
+        // If 60%+ of corner pixels match, we detected a uniform background
+        // But DON'T return early - continue with full extraction to get foreground colors too
         if ( $most_common_pct >= 60 ) {
-            // Use exact mode from the most common group
             $exact_samples = $most_common['samples'];
             $color_counts = [];
             foreach ( $exact_samples as $sample ) {
@@ -778,18 +968,13 @@ function difc_get_dominant_colors( $path ) {
             arsort( $color_counts );
             $exact_color = reset( $color_counts );
             
-            $primary_r = $exact_color['color'][0];
-            $primary_g = $exact_color['color'][1];
-            $primary_b = $exact_color['color'][2];
+            $bg_r = $exact_color['color'][0];
+            $bg_g = $exact_color['color'][1];
+            $bg_b = $exact_color['color'][2];
             
-            $primary_color = sprintf( '#%02x%02x%02x', $primary_r, $primary_g, $primary_b );
-            difc_log( "Corner-first detection: {$primary_color} (from {$most_common_pct}% of corner pixels)" );
-            
-            $primary_hsl = difc_rgb_to_hsl( $primary_r, $primary_g, $primary_b );
-            $secondary_color = difc_get_contrast_fallback( $primary_hsl );
-            
-            imagedestroy( $img );
-            return [ $primary_color, $secondary_color ];
+            $bg_color = sprintf( '#%02x%02x%02x', $bg_r, $bg_g, $bg_b );
+            difc_log( "Detected uniform background: {$bg_color} (from {$most_common_pct}% of corner pixels) - continuing with full extraction" );
+            // Continue to full extraction instead of returning early
         }
     }
 
@@ -865,8 +1050,8 @@ function difc_get_dominant_colors( $path ) {
         
         difc_log( "Most common edge color: RGB({$most_common['r']}, {$most_common['g']}, {$most_common['b']}) - {$most_common_pct}% of samples" );
         
-        // If the most common color represents 30%+ of edge samples, treat as uniform background
-        // Lower threshold to catch more uniform backgrounds
+        // If the most common color represents 30%+ of edge samples, we detected a uniform background
+        // But DON'T return early - continue with full extraction to get foreground colors too
         if ( $most_common_pct >= 30 ) {
             // Calculate exact color from the most common color group (use mean of that group)
             $exact_samples = $most_common['samples'];
@@ -878,20 +1063,13 @@ function difc_get_dominant_colors( $path ) {
                 $sum_g += $sample[1];
                 $sum_b += $sample[2];
             }
-            $primary_r = (int) ( $sum_r / count( $exact_samples ) );
-            $primary_g = (int) ( $sum_g / count( $exact_samples ) );
-            $primary_b = (int) ( $sum_b / count( $exact_samples ) );
+            $bg_r = (int) ( $sum_r / count( $exact_samples ) );
+            $bg_g = (int) ( $sum_g / count( $exact_samples ) );
+            $bg_b = (int) ( $sum_b / count( $exact_samples ) );
             
-            $primary_color = sprintf( '#%02x%02x%02x', $primary_r, $primary_g, $primary_b );
-            difc_log( "Detected uniform background color: {$primary_color} (from {$most_common_pct}% of edge samples)" );
-            
-            // For uniform backgrounds, secondary color is less important
-            // Use a lighter/darker version or white/black for contrast
-            $primary_hsl = difc_rgb_to_hsl( $primary_r, $primary_g, $primary_b );
-            $secondary_color = difc_get_contrast_fallback( $primary_hsl );
-            
-            imagedestroy( $img );
-            return [ $primary_color, $secondary_color ];
+            $bg_color = sprintf( '#%02x%02x%02x', $bg_r, $bg_g, $bg_b );
+            difc_log( "Detected uniform background color: {$bg_color} (from {$most_common_pct}% of edge samples) - continuing with full extraction" );
+            // Continue to full extraction instead of returning early
         }
     }
     
@@ -940,6 +1118,16 @@ function difc_get_dominant_colors( $path ) {
                 'hsl' => $hsl,
                 'salience' => $salience,
             ];
+            
+            // Debug: Log pink-like colors (hue around 0.9-1.0 or 0.0-0.1, high saturation)
+            if ( DIFC_DEBUG && ( ( $h >= 0.9 || $h <= 0.1 ) && $s > 0.5 ) ) {
+                $hex = sprintf( '#%02x%02x%02x', $r, $g, $b );
+                $h_str = number_format( $h, 2 );
+                $s_str = number_format( $s, 2 );
+                $l_str = number_format( $l, 2 );
+                $sal_str = number_format( $salience, 2 );
+                difc_log( "Sampled pink/magenta-like color: {$hex} at ({$x}, {$y}), HSL: H={$h_str}, S={$s_str}, L={$l_str}, salience={$sal_str}" );
+            }
         }
     }
 
@@ -951,8 +1139,20 @@ function difc_get_dominant_colors( $path ) {
     }
 
     difc_log( "Sampled " . count( $weighted_pixels ) . " salient pixels" );
+    
+    // Debug: Count pink-like pixels
+    $pink_count = 0;
+    foreach ( $weighted_pixels as $px ) {
+        $h = $px['hsl'][0];
+        $s = $px['hsl'][1];
+        if ( ( $h >= 0.85 || $h <= 0.15 ) && $s > 0.5 ) {
+            $pink_count++;
+        }
+    }
+    error_log( '[DIFC] Pink/magenta-like pixels sampled: ' . $pink_count . ' out of ' . count( $weighted_pixels ) );
 
     // ── 3. Weighted color clustering with salience ───────────────────────
+    // Preserve distinct colors by checking hue difference before clustering
     $clusters = [];
 
     foreach ( $weighted_pixels as $pixel_data ) {
@@ -961,24 +1161,37 @@ function difc_get_dominant_colors( $path ) {
         $matched = false;
 
         foreach ( $clusters as $i => &$cluster ) {
+            $pixel_hsl = $pixel_data['hsl'];
+            $cluster_hsl = $cluster['hsl_center'];
+            
+            // Calculate hue difference first - don't cluster very distinct hues
+            $h_diff = abs( $pixel_hsl[0] - $cluster_hsl[0] );
+            if ( $h_diff > 0.5 ) {
+                $h_diff = 1.0 - $h_diff; // Wrap around the color wheel
+            }
+            
+            // If hues are very different (>0.15 = ~54 degrees), don't cluster them
+            // This preserves distinct colors like pink vs lavender
+            if ( $h_diff > 0.15 ) {
+                continue; // Skip this cluster, try next one
+            }
+            
             // Use perceptual distance (HSL-based) for clustering
-            if ( difc_perceptual_color_distance( $pixel_data['hsl'], $cluster['hsl_center'] ) < DIFC_CLUSTER_THRESHOLD ) {
+            $distance = difc_perceptual_color_distance( $pixel_hsl, $cluster_hsl );
+            if ( $distance < DIFC_CLUSTER_THRESHOLD ) {
                 // Weighted merge: salience affects contribution
                 $total_weight = $cluster['total_weight'] + $weight;
-                $ratio = $weight / $total_weight;
                 
-                $cluster['rgb_center'] = [
-                    (int) ( $cluster['rgb_center'][0] * ( 1 - $ratio ) + $px[0] * $ratio ),
-                    (int) ( $cluster['rgb_center'][1] * ( 1 - $ratio ) + $px[1] * $ratio ),
-                    (int) ( $cluster['rgb_center'][2] * ( 1 - $ratio ) + $px[2] * $ratio ),
-                ];
-                
-                // Update HSL center (weighted average)
+                // Update HSL center first (weighted average in perceptual space)
                 $cluster['hsl_center'] = [
-                    difc_weighted_hue_average( $cluster['hsl_center'][0], $pixel_data['hsl'][0], $cluster['total_weight'], $weight ),
-                    ( $cluster['hsl_center'][1] * $cluster['total_weight'] + $pixel_data['hsl'][1] * $weight ) / $total_weight,
-                    ( $cluster['hsl_center'][2] * $cluster['total_weight'] + $pixel_data['hsl'][2] * $weight ) / $total_weight,
+                    difc_weighted_hue_average( $cluster_hsl[0], $pixel_hsl[0], $cluster['total_weight'], $weight ),
+                    ( $cluster_hsl[1] * $cluster['total_weight'] + $pixel_hsl[1] * $weight ) / $total_weight,
+                    ( $cluster_hsl[2] * $cluster['total_weight'] + $pixel_hsl[2] * $weight ) / $total_weight,
                 ];
+                
+                // Convert HSL center back to RGB (perceptual averaging avoids muddy colors)
+                $rgb_from_hsl = difc_hsl_to_rgb( $cluster['hsl_center'][0], $cluster['hsl_center'][1], $cluster['hsl_center'][2] );
+                $cluster['rgb_center'] = $rgb_from_hsl;
                 
                 $cluster['total_weight'] = $total_weight;
                 $cluster['count']++;
@@ -1002,22 +1215,191 @@ function difc_get_dominant_colors( $path ) {
         difc_log( "No clusters formed" );
         return [];
     }
+    
+    // Debug: Log all clusters before merging
+    difc_log( "Formed " . count( $clusters ) . " initial clusters:" );
+    $pink_clusters = [];
+    foreach ( $clusters as $idx => $cluster ) {
+        $rgb = $cluster['rgb_center'];
+        $hsl = $cluster['hsl_center'];
+        $hex = sprintf( '#%02x%02x%02x', $rgb[0], $rgb[1], $rgb[2] );
+        $h = number_format( $hsl[0], 2 );
+        $s = number_format( $hsl[1], 2 );
+        $l = number_format( $hsl[2], 2 );
+        $w = number_format( $cluster['total_weight'], 2 );
+        difc_log( "  Cluster {$idx}: {$hex} (HSL: H={$h}, S={$s}, L={$l}), weight={$w}, count={$cluster['count']}" );
+        
+        // Track pink/magenta clusters
+        if ( ( $hsl[0] >= 0.85 || $hsl[0] <= 0.15 ) && $hsl[1] > 0.5 ) {
+            $pink_clusters[] = [ 'idx' => $idx, 'hex' => $hex, 'weight' => $cluster['total_weight'], 'sat' => $hsl[1] ];
+        }
+    }
+    if ( ! empty( $pink_clusters ) ) {
+        error_log( '[DIFC] Found ' . count( $pink_clusters ) . ' pink/magenta clusters: ' . json_encode( $pink_clusters ) );
+    } else {
+        error_log( '[DIFC] WARNING: No pink/magenta clusters found!' );
+    }
 
-    // ── 4. Sort by salience-weighted dominance ───────────────────────────
+    // ── 3.5. Limit clusters and merge closest if needed (K-means-like approach) ─────────────
+    // When limit is exceeded, merge the two closest clusters, but preserve distinct colors
+    // Distinct colors (high hue difference) should not be merged even if close in other dimensions
+    while ( count( $clusters ) > DIFC_MAX_CLUSTERS ) {
+        $min_distance = PHP_FLOAT_MAX;
+        $merge_i = -1;
+        $merge_j = -1;
+        
+        // Find the two closest clusters, but avoid merging very distinct colors
+        for ( $i = 0; $i < count( $clusters ); $i++ ) {
+            for ( $j = $i + 1; $j < count( $clusters ); $j++ ) {
+                $hsl1 = $clusters[$i]['hsl_center'];
+                $hsl2 = $clusters[$j]['hsl_center'];
+                
+                // Calculate hue difference
+                $h_diff = abs( $hsl1[0] - $hsl2[0] );
+                if ( $h_diff > 0.5 ) {
+                    $h_diff = 1.0 - $h_diff; // Wrap around the color wheel
+                }
+                
+                // Don't merge colors with very different hues (more than 0.2 = ~72 degrees)
+                // This preserves distinct colors like pink vs lavender
+                if ( $h_diff > 0.2 ) {
+                    continue; // Skip merging very distinct hues
+                }
+                
+                $distance = difc_perceptual_color_distance( $hsl1, $hsl2 );
+                if ( $distance < $min_distance ) {
+                    $min_distance = $distance;
+                    $merge_i = $i;
+                    $merge_j = $j;
+                }
+            }
+        }
+        
+        // If no similar colors found (all are distinct), merge the two smallest clusters instead
+        if ( $merge_i < 0 || $merge_j < 0 ) {
+            // Find the two clusters with lowest total_weight (smallest/least important)
+            $min_weight = PHP_FLOAT_MAX;
+            $min_weight_i = -1;
+            $min_weight_j = -1;
+            
+            for ( $i = 0; $i < count( $clusters ); $i++ ) {
+                for ( $j = $i + 1; $j < count( $clusters ); $j++ ) {
+                    $combined_weight = $clusters[$i]['total_weight'] + $clusters[$j]['total_weight'];
+                    if ( $combined_weight < $min_weight ) {
+                        $min_weight = $combined_weight;
+                        $min_weight_i = $i;
+                        $min_weight_j = $j;
+                    }
+                }
+            }
+            
+            if ( $min_weight_i >= 0 && $min_weight_j >= 0 ) {
+                $merge_i = $min_weight_i;
+                $merge_j = $min_weight_j;
+                difc_log( "Merging two smallest clusters (all colors are distinct)" );
+            } else {
+                // Fallback: just merge first two if we can't find anything
+                if ( count( $clusters ) > 1 ) {
+                    $merge_i = 0;
+                    $merge_j = 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        if ( $merge_i >= 0 && $merge_j >= 0 ) {
+            // Merge cluster $merge_j into cluster $merge_i
+            $cluster_i = &$clusters[$merge_i];
+            $cluster_j = $clusters[$merge_j];
+            
+            $total_weight = $cluster_i['total_weight'] + $cluster_j['total_weight'];
+            $weight_i = $cluster_i['total_weight'] / $total_weight;
+            $weight_j = $cluster_j['total_weight'] / $total_weight;
+            
+            // Merge HSL centers (weighted average in perceptual space)
+            $cluster_i['hsl_center'] = [
+                difc_weighted_hue_average( $cluster_i['hsl_center'][0], $cluster_j['hsl_center'][0], $cluster_i['total_weight'], $cluster_j['total_weight'] ),
+                $cluster_i['hsl_center'][1] * $weight_i + $cluster_j['hsl_center'][1] * $weight_j,
+                $cluster_i['hsl_center'][2] * $weight_i + $cluster_j['hsl_center'][2] * $weight_j,
+            ];
+            
+            // Convert HSL center back to RGB (perceptual averaging)
+            $rgb_from_hsl = difc_hsl_to_rgb( $cluster_i['hsl_center'][0], $cluster_i['hsl_center'][1], $cluster_i['hsl_center'][2] );
+            $cluster_i['rgb_center'] = $rgb_from_hsl;
+            
+            $cluster_i['total_weight'] = $total_weight;
+            $cluster_i['count'] += $cluster_j['count'];
+            
+            // Remove merged cluster
+            array_splice( $clusters, $merge_j, 1 );
+            unset( $cluster_i );
+            
+            difc_log( "Merged clusters (now " . count( $clusters ) . " clusters)" );
+        } else {
+            // Should not happen, but break to avoid infinite loop
+            break;
+        }
+    }
+
+    // ── 4. Sort by salience-weighted dominance with chroma boost ───────────────────────────
+    // Calculate combined score: total_weight * (1 + avg_chroma * boost_factor)
+    // This matches Okmain's approach of considering chroma (saturation) as a prominence factor
+    foreach ( $clusters as &$cluster ) {
+        $avg_chroma = $cluster['hsl_center'][1]; // Saturation is chroma in HSL
+        $hue = $cluster['hsl_center'][0];
+        
+        // Extra boost for vibrant colors (pink/magenta, red, blue, etc.)
+        // Pink/magenta hues are around 0.9-1.0 or 0.0-0.1
+        $hue_boost = 1.0;
+        if ( $avg_chroma > 0.5 ) { // Only boost if already saturated
+            // Boost pink/magenta/red hues (visually prominent)
+            if ( ( $hue >= 0.85 || $hue <= 0.15 ) && $avg_chroma > 0.6 ) {
+                $hue_boost = 1.3; // 30% extra boost for vibrant pinks/magentas
+            }
+        }
+        
+        $cluster['prominence_score'] = $cluster['total_weight'] * ( 1.0 + $avg_chroma * DIFC_CHROMA_SORT_BOOST ) * $hue_boost;
+    }
+    unset( $cluster );
+    
     usort( $clusters, function( $a, $b ) {
-        // Sort by total salience weight (more salient = more important)
-        return $b['total_weight'] <=> $a['total_weight'];
+        // Sort by prominence score (salience weight + chroma boost)
+        // Higher chroma (saturation) gets a boost, matching Okmain's approach
+        $score_diff = $b['prominence_score'] <=> $a['prominence_score'];
+        
+        // If scores are close (within 20%), prefer higher saturation
+        if ( abs( $a['prominence_score'] - $b['prominence_score'] ) < ( max( $a['prominence_score'], $b['prominence_score'] ) * 0.2 ) ) {
+            $sat_diff = $b['hsl_center'][1] <=> $a['hsl_center'][1];
+            if ( $sat_diff !== 0 ) {
+                return $sat_diff; // Prefer higher saturation when scores are close
+            }
+        }
+        
+        return $score_diff;
     } );
 
     if ( empty( $clusters ) ) {
         return [];
     }
+    
+    // Debug: Log final clusters after sorting
+    difc_log( "Final clusters after sorting (top 10):" );
+    foreach ( array_slice( $clusters, 0, 10 ) as $idx => $cluster ) {
+        $rgb = $cluster['rgb_center'];
+        $hsl = $cluster['hsl_center'];
+        $hex = sprintf( '#%02x%02x%02x', $rgb[0], $rgb[1], $rgb[2] );
+        $prom = number_format( $cluster['prominence_score'], 2 );
+        $w = number_format( $cluster['total_weight'], 2 );
+        difc_log( "  #{$idx}: {$hex} (prominence={$prom}, weight={$w})" );
+    }
 
-    // ── 5. Select primary and secondary with contrast requirement ─────────
+    // ── 5. Select primary and secondary colors ─────────
     $primary = $clusters[0];
     $results = [];
     
-    // Primary color (most salient)
+    // Primary color (most salient/dominant color from image)
+    // This is the first color in the results array and will be saved to custom_colour field
     $results[] = sprintf(
         '#%02x%02x%02x',
         $primary['rgb_center'][0],
@@ -1025,150 +1407,62 @@ function difc_get_dominant_colors( $path ) {
         $primary['rgb_center'][2]
     );
 
-    // Secondary color: find the most salient color that contrasts well with primary
+    // Secondary color: Always black or white based on maximum contrast with primary
+    // This ensures optimal legibility for text/background use cases
     $primary_hsl = $primary['hsl_center'];
-    
-    if ( count( $clusters ) > 1 ) {
-        $best_secondary = null;
-        $best_score = -1;
-
-        // Evaluate remaining clusters for contrast, saturation, and legibility
-        foreach ( array_slice( $clusters, 1 ) as $cluster ) {
-            $cluster_hsl = $cluster['hsl_center'];
-            
-            // Calculate contrast score (emphasizes legibility for text/background)
-            $contrast_score = difc_calculate_legibility_contrast( $primary_hsl, $cluster_hsl );
-            
-            // Calculate chroma contrast (saturation + hue difference - the "brilliant contrast")
-            $saturation = $cluster_hsl[1]; // 0-1
-            $h_diff = abs( $primary_hsl[0] - $cluster_hsl[0] );
-            if ( $h_diff > 0.5 ) {
-                $h_diff = 1.0 - $h_diff; // Wrap around color wheel
-            }
-            $hue_contrast = $h_diff * 2.0; // Normalize 0-0.5 to 0-1
-            
-            // Chroma contrast = saturation × hue difference (brilliant colors with different hues)
-            $chroma_contrast = $saturation * $hue_contrast;
-            
-            // Strong chroma contrast boost - rewards vibrant colors with excellent hue separation
-            // This makes a small amount of vibrant blue beat a large amount of similar brown/orange
-            $chroma_boost = 1.0 + ( $chroma_contrast * ( DIFC_CHROMA_CONTRAST_WEIGHT - 1.0 ) );
-            
-            // Saturation boost - prefer vibrant over dull (additional boost)
-            $saturation_boost = 1.0 + ( $saturation * ( DIFC_SATURATION_BOOST - 1.0 ) );
-            
-            // Penalize similar hues more strongly (but chroma boost can overcome this)
-            $hue_penalty = $h_diff < DIFC_MIN_HUE_DIFFERENCE ? 0.5 : 1.0; // Less harsh penalty since chroma handles it
-            
-            // Base salience (pixel count weight) - but reduce its importance when chroma contrast is excellent
-            $salience_score = $cluster['total_weight'];
-            $salience_modifier = $chroma_contrast > 0.5 ? 0.7 : 1.0; // Reduce salience importance for excellent chroma
-            
-            // Combined score: chroma-boosted, saturation-boosted, contrast-weighted
-            // Chroma contrast can dramatically boost small amounts of brilliant contrasting colors
-            $combined_score = ( $salience_score * $salience_modifier )
-                * $chroma_boost 
-                * $saturation_boost 
-                * ( 1.0 + $contrast_score * ( DIFC_LEGIBILITY_WEIGHT - 1.0 ) )
-                * $hue_penalty;
-            
-            if ( $combined_score > $best_score ) {
-                $best_score = $combined_score;
-                $best_secondary = $cluster;
-            }
-        }
-
-        // If we found a good secondary, check contrast and apply fallback if needed
-        if ( $best_secondary ) {
-            $secondary_rgb = $best_secondary['rgb_center'];
-            $secondary_hsl = $best_secondary['hsl_center'];
-            
-            // Check if contrast meets minimum legibility requirement
-            $contrast_ratio = difc_calculate_wcag_contrast_ratio( $primary_hsl, $secondary_hsl );
-            
-            // Check hue contrast - if sufficient, keep the color even if lightness contrast is low
-            $h_diff = abs( $primary_hsl[0] - $secondary_hsl[0] );
-            if ( $h_diff > 0.5 ) {
-                $h_diff = 1.0 - $h_diff; // Wrap around color wheel
-            }
-            $has_good_hue_contrast = $h_diff >= DIFC_MIN_HUE_DIFFERENCE;
-            
-            if ( $contrast_ratio >= DIFC_MIN_CONTRAST_RATIO || $has_good_hue_contrast ) {
-                // Good contrast OR good hue contrast - use the selected color
-                $results[] = sprintf(
-                    '#%02x%02x%02x',
-                    $secondary_rgb[0],
-                    $secondary_rgb[1],
-                    $secondary_rgb[2]
-                );
-                if ( $contrast_ratio < DIFC_MIN_CONTRAST_RATIO && $has_good_hue_contrast ) {
-                    difc_log( "Using secondary color despite low contrast ({$contrast_ratio}:1) due to good hue contrast ({$h_diff})" );
-                }
-            } else {
-                // Insufficient contrast AND insufficient hue contrast - use white or black fallback
-                $fallback_color = difc_get_contrast_fallback( $primary_hsl );
-                $results[] = $fallback_color;
-                difc_log( "Secondary color contrast insufficient ({$contrast_ratio}:1) and hue contrast insufficient ({$h_diff}), using fallback: {$fallback_color}" );
-            }
-        } elseif ( isset( $clusters[1] ) ) {
-            // Fallback: check second most salient for contrast
-            $fallback_cluster = $clusters[1];
-            $fallback_hsl = $fallback_cluster['hsl_center'];
-            $contrast_ratio = difc_calculate_wcag_contrast_ratio( $primary_hsl, $fallback_hsl );
-            
-            // Check hue contrast
-            $h_diff = abs( $primary_hsl[0] - $fallback_hsl[0] );
-            if ( $h_diff > 0.5 ) {
-                $h_diff = 1.0 - $h_diff;
-            }
-            $has_good_hue_contrast = $h_diff >= DIFC_MIN_HUE_DIFFERENCE;
-            
-            if ( $contrast_ratio >= DIFC_MIN_CONTRAST_RATIO || $has_good_hue_contrast ) {
-                $results[] = sprintf(
-                    '#%02x%02x%02x',
-                    $fallback_cluster['rgb_center'][0],
-                    $fallback_cluster['rgb_center'][1],
-                    $fallback_cluster['rgb_center'][2]
-                );
-                if ( $contrast_ratio < DIFC_MIN_CONTRAST_RATIO && $has_good_hue_contrast ) {
-                    difc_log( "Using fallback cluster despite low contrast ({$contrast_ratio}:1) due to good hue contrast ({$h_diff})" );
-                }
-            } else {
-                // Use white/black fallback
-                $fallback_color = difc_get_contrast_fallback( $primary_hsl );
-                $results[] = $fallback_color;
-                difc_log( "Fallback cluster contrast insufficient ({$contrast_ratio}:1) and hue contrast insufficient ({$h_diff}), using white/black: {$fallback_color}" );
-            }
-        } else {
-            // No secondary color found at all - use white/black fallback
-            $fallback_color = difc_get_contrast_fallback( $primary_hsl );
-            $results[] = $fallback_color;
-            difc_log( "No secondary color found, using fallback: {$fallback_color}" );
-        }
-    } else {
-        // Only one cluster - still need a secondary color, use fallback
-        $fallback_color = difc_get_contrast_fallback( $primary_hsl );
-        $results[] = $fallback_color;
-        difc_log( "Only one cluster found, using fallback for secondary: {$fallback_color}" );
-    }
+    $secondary_color = difc_get_contrast_fallback( $primary_hsl );
+    $results[] = $secondary_color;
+    difc_log( "Secondary color set to {$secondary_color} for maximum contrast with primary" );
 
     // Extract up to 10 colors for palette (extend results array)
     // Colors 1 and 2 are already primary and secondary
-    $palette_colors = array_slice( $clusters, 0, 10 ); // Get top 10 clusters
+    
+    // First, add top clusters by prominence score
+    $palette_colors = array_slice( $clusters, 0, 10 );
+    $added_colors = [];
+    
     for ( $i = 2; $i < count( $palette_colors ); $i++ ) {
         $cluster = $palette_colors[ $i ];
-        $results[] = sprintf(
-            '#%02x%02x%02x',
-            $cluster['rgb_center'][0],
-            $cluster['rgb_center'][1],
-            $cluster['rgb_center'][2]
-        );
+        $hex = sprintf( '#%02x%02x%02x', $cluster['rgb_center'][0], $cluster['rgb_center'][1], $cluster['rgb_center'][2] );
+        $results[] = $hex;
+        $added_colors[] = $hex;
+    }
+    
+    // Ensure we include high-saturation colors even if they have lower total weight
+    // This catches visually prominent colors that might be in smaller areas
+    if ( count( $results ) < 10 ) {
+        // Sort remaining clusters by saturation (descending) to find vibrant colors
+        $remaining_clusters = array_slice( $clusters, count( $palette_colors ) );
+        usort( $remaining_clusters, function( $a, $b ) {
+            // Sort by saturation first, then by total weight
+            $sat_diff = $b['hsl_center'][1] <=> $a['hsl_center'][1];
+            if ( $sat_diff !== 0 ) {
+                return $sat_diff;
+            }
+            return $b['total_weight'] <=> $a['total_weight'];
+        } );
+        
+        // Add high-saturation colors that aren't already included
+        foreach ( $remaining_clusters as $cluster ) {
+            if ( count( $results ) >= 10 ) {
+                break;
+            }
+            
+            $hex = sprintf( '#%02x%02x%02x', $cluster['rgb_center'][0], $cluster['rgb_center'][1], $cluster['rgb_center'][2] );
+            
+            // Only add if not already in results and has good saturation
+            if ( ! in_array( $hex, $added_colors ) && $cluster['hsl_center'][1] > 0.4 ) {
+                $results[] = $hex;
+                $added_colors[] = $hex;
+                difc_log( "Added high-saturation color to palette: {$hex} (saturation: " . number_format( $cluster['hsl_center'][1], 2 ) . ", weight: " . number_format( $cluster['total_weight'], 2 ) . ")" );
+            }
+        }
     }
     
     // Pad to 10 colors if we have fewer
     while ( count( $results ) < 10 ) {
-        // Use variations of primary color or fallback
-        $results[] = $fallback_color;
+        // Use empty string for missing colors (will be handled by validation)
+        $results[] = '';
     }
 
     return $results;
@@ -1215,7 +1509,33 @@ function difc_rgb_to_hsl( $r, $g, $b ) {
 }
 
 /**
+ * Convert HSL (0-1, 0-1, 0-1) to RGB (0-255, 0-255, 0-255)
+ * This ensures perceptual color averaging in HSL space before converting back to RGB
+ */
+function difc_hsl_to_rgb( $h, $s, $l ) {
+    if ( $s == 0 ) {
+        // Grayscale
+        $r = $g = $b = $l;
+    } else {
+        $q = $l < 0.5 ? $l * ( 1 + $s ) : $l + $s - $l * $s;
+        $p = 2 * $l - $q;
+        
+        $r = difc_hue_to_rgb( $p, $q, $h + 1/3 );
+        $g = difc_hue_to_rgb( $p, $q, $h );
+        $b = difc_hue_to_rgb( $p, $q, $h - 1/3 );
+    }
+    
+    // Convert to 0-255 range and clamp
+    $r = max( 0, min( 255, round( $r * 255 ) ) );
+    $g = max( 0, min( 255, round( $g * 255 ) ) );
+    $b = max( 0, min( 255, round( $b * 255 ) ) );
+    
+    return [ $r, $g, $b ];
+}
+
+/**
  * Calculate color salience score based on saturation, luminance, and position
+ * Uses distance-based position weighting (like Okmain) instead of binary center region
  */
 function difc_calculate_salience( $saturation, $luminance, $x, $y, $center_x_min, $center_x_max, $center_y_min, $center_y_max ) {
     $salience = 1.0;
@@ -1230,10 +1550,28 @@ function difc_calculate_salience( $saturation, $luminance, $x, $y, $center_x_min
     $luminance_score = max( 0.3, $luminance_score ); // Don't penalize too harshly
     $salience *= $luminance_score;
 
-    // Boost center region (where important content usually is)
-    if ( $x >= $center_x_min && $x <= $center_x_max && 
-         $y >= $center_y_min && $y <= $center_y_max ) {
-        $salience *= DIFC_CENTER_WEIGHT;
+    // Distance-based position weighting (like Okmain's center-weighted mask)
+    // Calculate distance from center of image
+    $center_x = ( $center_x_min + $center_x_max ) / 2;
+    $center_y = ( $center_y_min + $center_y_max ) / 2;
+    $max_distance = sqrt( pow( $center_x_max - $center_x_min, 2 ) + pow( $center_y_max - $center_y_min, 2 ) ) / 2;
+    
+    if ( $max_distance > 0 ) {
+        $distance_from_center = sqrt( pow( $x - $center_x, 2 ) + pow( $y - $center_y, 2 ) );
+        $normalized_distance = min( 1.0, $distance_from_center / $max_distance );
+        
+        // Create smooth gradient: pixels close to center get full weight, weight decreases with distance
+        // Use a smooth curve that plateaus for central pixels (like Okmain's mask)
+        // Formula: weight = 1 + (max_weight - 1) * (1 - normalized_distance)^2
+        // This gives full weight at center, smoothly decreasing to 1.0 at edges
+        $position_weight = 1.0 + ( DIFC_CENTER_WEIGHT - 1.0 ) * pow( 1.0 - $normalized_distance, 2 );
+        $salience *= $position_weight;
+    } else {
+        // Fallback: if max_distance is 0, use binary center check
+        if ( $x >= $center_x_min && $x <= $center_x_max && 
+             $y >= $center_y_min && $y <= $center_y_max ) {
+            $salience *= DIFC_CENTER_WEIGHT;
+        }
     }
 
     return $salience;
@@ -2101,17 +2439,13 @@ function difc_ajax_extract_attachment_colors() {
     $colors = array_pad( $validated_colors, 10, '' );
     
     // Save colors to attachment fields (fields are in groups: color_1, color_2, etc.)
-    // ACF group fields need to be updated as an array with sub-field names as keys
+    // Use the same approach as difc_extract_and_save() which works correctly
     $saved_count = 0;
     $errors = [];
     
-    // Debug: List all meta keys on this attachment to see what ACF created
-    $all_meta = get_post_meta( $attachment_id );
-    error_log( "[DIFC] All meta keys on attachment {$attachment_id}:" );
-    foreach ( $all_meta as $key => $value ) {
-        if ( strpos( $key, 'color' ) !== false || strpos( $key, 'image_col' ) !== false || strpos( $key, 'media_color' ) !== false ) {
-            error_log( "[DIFC]   - {$key}: " . ( is_array( $value ) ? print_r( $value, true ) : $value[0] ?? 'empty' ) );
-        }
+    // Ensure ACF field definitions are loaded for attachments
+    if ( function_exists( 'acf_get_field_groups' ) ) {
+        acf_get_field_groups( [ 'post_type' => 'attachment' ] );
     }
     
     try {
@@ -2123,136 +2457,60 @@ function difc_ajax_extract_attachment_colors() {
             $field_name = "image_col_{$color_index}_name";
             
             if ( ! empty( $color_hex ) && preg_match( '/^#[0-9a-fA-F]{6}$/', $color_hex ) ) {
-                // Generate color name
-                $color_name = difc_get_color_name( $color_hex );
+                // Generate color name if not already set (same as working code)
+                $existing_name = get_field( $field_name, $attachment_id );
+                $color_name = empty( $existing_name ) ? difc_get_color_name( $color_hex ) : $existing_name;
                 
-                // Update the group field with an array containing both sub-fields
-                // ACF expects group fields to be updated as: group_name => [sub_field_name => value, ...]
+                // Update group field with both hex and name (exact same as working code)
                 $group_data = [
                     $field_hex => $color_hex,
                     $field_name => $color_name,
                 ];
                 
-                // Try multiple field name variations
-                $field_variations = [
-                    $group_name,  // color_1
-                    "media_color_palette_{$group_name}",  // media_color_palette_color_1
-                    "media_color_palette_{$field_hex}",  // media_color_palette_image_col_1_hex (direct sub-field)
-                ];
+                $group_result = update_field( $group_name, $group_data, $attachment_id );
                 
-                $group_field = false;
-                $found_field_name = false;
-                
-                // Try to find the field using different names
-                foreach ( $field_variations as $field_name_to_try ) {
-                    $test_field = get_field_object( $field_name_to_try, $attachment_id, false );
-                    if ( $test_field ) {
-                        $group_field = $test_field;
-                        $found_field_name = $field_name_to_try;
-                        error_log( "[DIFC] Found field using name: {$field_name_to_try}, key: " . ( $group_field['key'] ?? 'none' ) );
-                        break;
+                // Fallback: try updating sub-fields directly (same as working code)
+                if ( ! $group_result ) {
+                    update_field( $field_hex, $color_hex, $attachment_id );
+                    if ( empty( $existing_name ) ) {
+                        update_field( $field_name, $color_name, $attachment_id );
                     }
                 }
                 
-                // If group field not found, try getting all fields to see what's available
-                if ( ! $group_field ) {
-                    error_log( "[DIFC] Field {$group_name} not found, checking all fields on attachment {$attachment_id}" );
-                    
-                    // Get all field groups for this attachment
-                    $field_groups = acf_get_field_groups( [ 'post_type' => 'attachment' ] );
-                    error_log( "[DIFC] Found " . count( $field_groups ) . " field groups for attachments" );
-                    
-                    foreach ( $field_groups as $fg ) {
-                        error_log( "[DIFC] Field group: {$fg['title']} (key: {$fg['key']})" );
-                        $fields_in_group = acf_get_fields( $fg );
-                        if ( $fields_in_group ) {
-                            foreach ( $fields_in_group as $f ) {
-                                error_log( "[DIFC]   - Field: {$f['name']} (key: {$f['key']}, type: {$f['type']})" );
-                                if ( $f['name'] === $group_name || $f['name'] === 'media_color_palette' ) {
-                                    $group_field = $f;
-                                    $found_field_name = $f['name'];
-                                    error_log( "[DIFC]   -> Matched! Using this field" );
-                                    break 2;
-                                }
-                            }
-                        }
-                    }
+                // Clear cache for this specific field before verification
+                if ( function_exists( 'acf_flush_value_cache' ) ) {
+                    acf_flush_value_cache( $attachment_id, $field_hex );
+                    acf_flush_value_cache( $attachment_id, $field_name );
                 }
                 
-                // Try updating sub-fields directly first (simpler approach)
-                // ACF allows updating nested group sub-fields directly using the full path
-                $hex_result = update_field( $field_hex, $color_hex, $attachment_id );
-                $name_result = update_field( $field_name, $color_name, $attachment_id );
+                // Verify the field was actually saved by reading it back
+                $verify_hex = get_field( $field_hex, $attachment_id, false ); // false = no formatting, bypass cache
+                $verify_name = get_field( $field_name, $attachment_id, false );
                 
-                error_log( "[DIFC] Direct sub-field update - hex field '{$field_hex}': " . ( $hex_result !== false ? 'success' : 'failed' ) . ", name field '{$field_name}': " . ( $name_result !== false ? 'success' : 'failed' ) );
-                
-                // Also try with group prefix
-                if ( $hex_result === false ) {
-                    $hex_result = update_field( "{$group_name}_{$field_hex}", $color_hex, $attachment_id );
-                    error_log( "[DIFC] Trying with group prefix '{$group_name}_{$field_hex}': " . ( $hex_result !== false ? 'success' : 'failed' ) );
-                }
-                if ( $name_result === false ) {
-                    $name_result = update_field( "{$group_name}_{$field_name}", $color_name, $attachment_id );
-                    error_log( "[DIFC] Trying with group prefix '{$group_name}_{$field_name}': " . ( $name_result !== false ? 'success' : 'failed' ) );
-                }
-                
-                // Last resort: try updating post meta directly
-                if ( $hex_result === false || $name_result === false ) {
-                    error_log( "[DIFC] Trying direct post_meta update" );
-                    // ACF stores fields as meta with field name as key
+                if ( $verify_hex === $color_hex || $verify_name === $color_name ) {
+                    $saved_count++;
+                    difc_log( "Successfully saved color {$color_index}: {$color_hex}" );
+                } else {
+                    // If verification failed, try one more time with direct post_meta
                     $meta_hex_result = update_post_meta( $attachment_id, $field_hex, $color_hex );
                     $meta_name_result = update_post_meta( $attachment_id, $field_name, $color_name );
-                    error_log( "[DIFC] Direct meta update - hex: " . ( $meta_hex_result ? 'success' : 'failed' ) . ", name: " . ( $meta_name_result ? 'success' : 'failed' ) );
                     
-                    if ( $meta_hex_result || $meta_name_result ) {
-                        $hex_result = $meta_hex_result ? true : $hex_result;
-                        $name_result = $meta_name_result ? true : $name_result;
+                    // Clear cache again
+                    if ( function_exists( 'acf_flush_value_cache' ) ) {
+                        acf_flush_value_cache( $attachment_id, $field_hex );
+                        acf_flush_value_cache( $attachment_id, $field_name );
                     }
-                }
-                
-                if ( $hex_result !== false || $name_result !== false ) {
-                    $saved_count++;
-                    error_log( "[DIFC] Successfully saved color {$color_index} using direct sub-field update" );
-                    continue; // Success, move to next color
-                }
-                
-                // If direct update failed, try group update
-                if ( ! $group_field ) {
-                    error_log( "[DIFC] Field {$group_name} still not found after searching" );
-                    // Try one more time with just the group name, maybe ACF will find it
-                    $group_result = update_field( $group_name, $group_data, $attachment_id );
-                    if ( $group_result !== false ) {
+                    
+                    // Verify again
+                    $verify_hex = get_field( $field_hex, $attachment_id, false );
+                    $verify_name = get_field( $field_name, $attachment_id, false );
+                    
+                    if ( $verify_hex === $color_hex || $verify_name === $color_name ) {
                         $saved_count++;
-                        error_log( "[DIFC] Successfully saved color {$color_index} using group name directly" );
-                        continue;
-                    }
-                    $errors[] = "Field {$group_name} not found";
-                    continue;
-                }
-                
-                error_log( "[DIFC] Using field name: {$found_field_name}, updating with data: " . print_r( $group_data, true ) );
-                
-                // Try updating with the found field name
-                $group_result = update_field( $found_field_name, $group_data, $attachment_id );
-                
-                if ( $group_result !== false ) {
-                    $saved_count++;
-                    error_log( "[DIFC] Successfully saved color {$color_index} using field name" );
-                } else {
-                    // Try with field key
-                    if ( isset( $group_field['key'] ) ) {
-                        error_log( "[DIFC] Trying with field key: {$group_field['key']}" );
-                        $key_result = update_field( $group_field['key'], $group_data, $attachment_id );
-                        if ( $key_result !== false ) {
-                            $saved_count++;
-                            error_log( "[DIFC] Successfully saved color {$color_index} using field key" );
-                        } else {
-                            $errors[] = "Failed to save color {$color_index} (all methods failed)";
-                            error_log( "[DIFC] All update methods failed for {$group_name}" );
-                        }
+                        difc_log( "Successfully saved color {$color_index} using post_meta fallback" );
                     } else {
-                        $errors[] = "Failed to save color {$color_index} (no field key available)";
-                        error_log( "[DIFC] Failed to save group {$group_name}, no field key" );
+                        $errors[] = "Failed to save color {$color_index}";
+                        difc_log( "Failed to save color {$color_index} - expected hex: {$color_hex}, got: " . ( $verify_hex ?: 'empty' ) );
                     }
                 }
             }
@@ -2295,5 +2553,39 @@ function difc_ajax_extract_attachment_colors() {
         wp_send_json_error( [ 'message' => sprintf( __( 'Error saving colors: %s', 'difc' ), $e->getMessage() ) ] );
     } catch ( Error $e ) {
         wp_send_json_error( [ 'message' => sprintf( __( 'Fatal error saving colors: %s', 'difc' ), $e->getMessage() ) ] );
+    }
+}
+
+/**
+ * AJAX handler to check if colors were updated server-side (for JavaScript polling)
+ */
+function difc_ajax_check_color_update() {
+    // Check permissions
+    if ( ! current_user_can( 'edit_posts' ) ) {
+        wp_send_json_error( [ 'message' => __( 'Insufficient permissions.', 'difc' ) ] );
+        return;
+    }
+    
+    $post_id = isset( $_GET['post_id'] ) ? intval( $_GET['post_id'] ) : 0;
+    
+    if ( ! $post_id ) {
+        wp_send_json_error( [ 'message' => __( 'Invalid post ID.', 'difc' ) ] );
+        return;
+    }
+    
+    // Get the timestamp and image ID from post meta
+    $timestamp = get_post_meta( $post_id, '_difc_colors_updated_timestamp', true );
+    $image_id = get_post_meta( $post_id, '_difc_colors_updated_image_id', true );
+    
+    if ( $timestamp && $image_id ) {
+        wp_send_json_success( [
+            'timestamp' => $timestamp,
+            'image_id' => $image_id
+        ] );
+    } else {
+        wp_send_json_success( [
+            'timestamp' => null,
+            'image_id' => null
+        ] );
     }
 }
